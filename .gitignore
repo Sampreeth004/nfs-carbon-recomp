@@ -7,6 +7,7 @@ guest_image.bin
 run_stdout.log
 run_stderr.log
 dispatch_tolerance.log
+unregistered_targets.txt
 
 # Codegen output (regenerated from game/default.xex)
 generated/default/

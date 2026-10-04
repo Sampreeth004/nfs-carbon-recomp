@@ -44,18 +44,4 @@ class NfsCarbonApp : public rex::ReXApp {
   void OnPostSetup() override {
     rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
   }
-
-  void OnPostLoadXexImage() override {
-    static bool dumped = false;
-    if (dumped) {
-      return;
-    }
-    dumped = true;
-    uint8_t* membase = runtime()->memory()->virtual_membase();
-    std::FILE* f = std::fopen("guest_image.bin", "wb");
-    if (f) {
-      std::fwrite(membase + REX_IMAGE_BASE, 1, REX_IMAGE_SIZE, f);
-      std::fclose(f);
-    }
-  }
 };
