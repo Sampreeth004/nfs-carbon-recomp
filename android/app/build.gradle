@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = "com.sampreeth.nfscarbon"
+    compileSdkVersion 35
+    buildToolsVersion "34.0.0"
+
+    defaultConfig {
+        applicationId "com.sampreeth.nfscarbon"
+        minSdkVersion 28
+        targetSdkVersion 35
+        versionCode 1
+        versionName "1.0"
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    sourceSets.main {
+        // Prebuilt: libnfscarbon.so, librexruntime.so, librexgpu-xenos.so
+        jniLibs.srcDir 'src/main/jniLibs'
+    }
+
+    packaging {
+        // Extract libs to the native library dir so the runtime can locate the
+        // GPU plugin and user files by real paths.
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+}
