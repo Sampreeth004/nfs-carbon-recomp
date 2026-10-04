@@ -1,4 +1,4 @@
-package com.sampreeth.nfscarbon;
+package com.eagames.nfscarbon;
 
 import org.libsdl.app.SDLActivity;
 

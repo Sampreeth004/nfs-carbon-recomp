@@ -29,6 +29,15 @@ if(WIN32)
     list(APPEND NFSCARBON_SOURCES src/crash_diag.cpp)
 endif()
 
+if(ANDROID)
+    # JNI bridge for the on-screen touch gamepad overlay.
+    list(APPEND NFSCARBON_SOURCES src/touch_bridge.cpp)
+    # CPU core pinning watchdog for the command processor and main guest thread.
+    list(APPEND NFSCARBON_SOURCES src/thread_affinity.cpp)
+    # Futex sleep instead of a busy spin while D3D waits for ring space.
+    list(APPEND NFSCARBON_SOURCES src/ring_wait_hook.cpp)
+endif()
+
 if(WIN32)
     add_executable(nfscarbon WIN32 ${NFSCARBON_SOURCES})
     target_link_libraries(nfscarbon PRIVATE dbghelp)
@@ -50,6 +59,10 @@ if(ANDROID)
     # that overflows ELF's 16-bit section count and breaks strip/dlopen. Merge
     # them back into one .text/.data per object.
     target_compile_options(nfscarbon PRIVATE -fno-function-sections -fno-data-sections)
+    # Bind guest-to-guest calls inside the library directly. Otherwise every
+    # call to an exported sub_XXXXXXXX goes through the PLT (~19.8k slots).
+    # Hooks still win: the static linker picks strong definitions first.
+    target_link_options(nfscarbon PRIVATE "LINKER:-Bsymbolic-functions")
     if(TARGET nfscarbon_recomp)
         target_compile_options(nfscarbon_recomp PRIVATE
             -fno-function-sections -fno-data-sections)

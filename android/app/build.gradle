@@ -3,12 +3,12 @@ plugins {
 }
 
 android {
-    namespace = "com.sampreeth.nfscarbon"
+    namespace = "com.eagames.nfscarbon"
     compileSdkVersion 35
     buildToolsVersion "34.0.0"
 
     defaultConfig {
-        applicationId "com.sampreeth.nfscarbon"
+        applicationId "com.eagames.nfscarbon"
         minSdkVersion 28
         targetSdkVersion 35
         versionCode 1
