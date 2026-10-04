@@ -1,0 +1,24 @@
+# Build output
+out/
+logs/
+
+# Local runtime diagnostics
+guest_image.bin
+run_stdout.log
+run_stderr.log
+dispatch_tolerance.log
+
+# Codegen output (regenerated from game/default.xex)
+generated/default/
+
+# Game data (copyrighted; extract from your own disc)
+game/
+*.iso
+
+# IDE / OS noise
+.vs/
+.idea/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
