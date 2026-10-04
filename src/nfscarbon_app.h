@@ -24,13 +24,15 @@ class NfsCarbonApp : public rex::ReXApp {
     if (!paths.game_data_root.empty()) {
       return;
     }
+    const std::filesystem::path exe_dir = rex::filesystem::GetExecutableFolder();
     const std::filesystem::path candidates[] = {
-        rex::filesystem::GetExecutableFolder() / "game",
+        exe_dir / "game",
         std::filesystem::current_path() / "game",
+        (exe_dir / ".." / ".." / ".." / "game").lexically_normal(),
     };
     for (const auto& candidate : candidates) {
       std::error_code ec;
-      if (std::filesystem::is_directory(candidate, ec)) {
+      if (std::filesystem::is_directory(candidate / "NFS", ec)) {
         paths.game_data_root = candidate;
         return;
       }
