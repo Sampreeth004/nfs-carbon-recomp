@@ -1,3 +1,12 @@
 <resources>
-    <string name="app_name">Game</string>
+    <string name="app_name">NFS Carbon</string>
+    <string name="launcher_subtitle">ReXGlue recompilation (Xbox 360)</string>
+    <string name="launcher_hint">Tap PLAY to start the game. Settings are written to the runtime config before launch.</string>
+    <string name="play">PLAY</string>
+    <string name="settings">SETTINGS</string>
+    <string name="game_data">Game data</string>
+    <string name="graphics">Graphics</string>
+    <string name="gpu_driver">GPU driver</string>
+    <string name="touch_controls">Touch controls</string>
+    <string name="about">About</string>
 </resources>

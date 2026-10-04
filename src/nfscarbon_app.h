@@ -5,8 +5,13 @@
 #include <rex/rex_app.h>
 
 #include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
 
 #if defined(__ANDROID__)
+#include "thread_affinity.h"
+
 extern "C" const char* SDL_GetAndroidInternalStoragePath(void);
 extern "C" const char* SDL_GetAndroidExternalStoragePath(void);
 #endif
@@ -68,9 +73,33 @@ class NfsCarbonApp : public rex::ReXApp {
 #endif
   }
 
+  std::optional<rex::PathConfig> OnFinalizePaths(
+      const rex::PathConfig& defaults,
+      std::function<void(rex::PathConfig)> resume) override {
+    (void)resume;
+#if defined(__ANDROID__)
+    // SetupEnvironment loads the TOML only after OnConfigurePaths has already
+    // built the path defaults, so the game_data_root written by the launcher
+    // must be applied here, once the config is live and before the runtime is
+    // constructed.
+    rex::PathConfig paths = defaults;
+    std::string configured_root = rex::cvar::GetFlagByName("game_data_root");
+    if (!configured_root.empty()) {
+      paths.game_data_root = configured_root;
+    }
+    return paths;
+#else
+    return defaults;
+#endif
+  }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
     config.gpu_plugin = "xenos";
 
+#ifndef __ANDROID__
+    // On Android the launcher writes these keys to the TOML config, and
+    // OnPreSetup runs before LoadConfig, so setting defaults here would win
+    // with Source::kRuntime and silently override the launcher.
     auto set_default = [](const char* name, const char* value) {
       if (rex::cvar::GetFlagSource(name) == rex::cvar::Source::kDefault) {
         rex::cvar::SetFlagByName(name, value);
@@ -104,12 +133,20 @@ class NfsCarbonApp : public rex::ReXApp {
     set_default("keybind_dpad_right", "Shift+Right");
     set_default("keybind_back", "Tab");
     set_default("keybind_start", "Escape");
+#endif
   }
 
   void OnPostSetup() override {
     rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
+#if defined(__ANDROID__)
+    // Guest threads keep being created after this; the watchdog rescans.
+    thread_affinity_ = nfscarbon::afinidad::Arrancar();
+#endif
   }
 
  private:
   std::filesystem::path user_data_root_;
+#if defined(__ANDROID__)
+  nfscarbon::afinidad::VigilantePtr thread_affinity_;
+#endif
 };
