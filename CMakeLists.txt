@@ -36,6 +36,8 @@ if(ANDROID)
     list(APPEND NFSCARBON_SOURCES src/thread_affinity.cpp)
     # Futex sleep instead of a busy spin while D3D waits for ring space.
     list(APPEND NFSCARBON_SOURCES src/ring_wait_hook.cpp)
+    # Retail render mode 2 (one tile, no MSAA) for the scene: removes the tiling/MSAA redraws.
+    list(APPEND NFSCARBON_SOURCES src/render_mode_hook.cpp)
 endif()
 
 if(WIN32)
