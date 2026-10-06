@@ -135,6 +135,31 @@ void ShaderCompiler::SetCacheDirectory(const std::filesystem::path& dir) {
   std::filesystem::create_directories(cache_dir_, ec);
 }
 
+uint64_t ShaderCompiler::KeyFor(const std::string& glsl) {
+  return HashBytes(glsl.data(), glsl.size(), kCacheVersion);
+}
+
+bool ShaderCompiler::LoadCached(uint64_t key, std::vector<uint32_t>& spirv) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (cache_dir_.empty()) {
+    return false;
+  }
+  char name[40];
+  std::snprintf(name, sizeof(name), "%016llx.spv", static_cast<unsigned long long>(key));
+  std::ifstream in(cache_dir_ / name, std::ios::binary | std::ios::ate);
+  if (!in) {
+    return false;
+  }
+  auto size = in.tellg();
+  if (size <= 0 || size % 4 != 0) {
+    return false;
+  }
+  spirv.resize(size_t(size) / 4);
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(spirv.data()), size);
+  return in && spirv[0] == 0x07230203u;
+}
+
 bool ShaderCompiler::Compile(const std::string& glsl, bool vertex, std::vector<uint32_t>& spirv,
                              std::string& error) {
   std::lock_guard<std::mutex> lock(mutex_);

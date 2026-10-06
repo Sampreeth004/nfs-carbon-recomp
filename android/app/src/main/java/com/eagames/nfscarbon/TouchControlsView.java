@@ -50,6 +50,30 @@ public class TouchControlsView extends View {
     private boolean padActive = true;
     private float wheelValue = 0f;
     private boolean wheelHeld = false;
+    // Arrow steering: pointers holding the left/right arrows, and the stick
+    // value ramping towards the direction they ask for.
+    private final Map<Integer, String> steerPointers = new HashMap<>();
+    private boolean steerTicking = false;
+    private final Runnable steerRamp = new Runnable() {
+        @Override
+        public void run() {
+            float target = steerTarget();
+            // Full lock in ~120 ms, back to centre in ~80 ms.
+            float step = target == 0f ? 0.2f : 0.14f;
+            if (Math.abs(target - wheelValue) <= step) {
+                wheelValue = target;
+            } else {
+                wheelValue += Math.signum(target - wheelValue) * step;
+            }
+            invalidate();
+            updateNative();
+            if (wheelValue != target || target != 0f) {
+                handler.postDelayed(this, 16);
+            } else {
+                steerTicking = false;
+            }
+        }
+    };
     private Listener listener;
 
     private final Runnable wheelSpring = new Runnable() {
@@ -121,6 +145,8 @@ public class TouchControlsView extends View {
             wheelHeld = false;
             wheelValue = 0f;
             handler.removeCallbacks(wheelSpring);
+            handler.removeCallbacks(steerRamp);
+            steerTicking = false;
             updateNative();
         }
     }
@@ -156,12 +182,15 @@ public class TouchControlsView extends View {
                 }
             } else if ("wheel".equals(control.kind)) {
                 knobX = wheelValue;
+            } else if ("steer".equals(control.kind)) {
+                knobX = wheelValue;
             } else if ("pedal".equals(control.kind) || "trigger".equals(control.kind)) {
                 Float pressure = triggers.get(control.id);
                 knobY = pressure != null ? pressure : 0f;
             }
             boolean pressed = isControlPressed(control) || triggers.containsKey(control.id)
-                    || ("wheel".equals(control.kind) && wheelHeld);
+                    || ("wheel".equals(control.kind) && wheelHeld)
+                    || ("steer".equals(control.kind) && steerPointers.containsValue(control.id));
             TouchRenderer.drawControl(canvas, paint, control, bounds, alpha, pressed, false,
                     knobX, knobY);
         }
@@ -243,6 +272,9 @@ public class TouchControlsView extends View {
             updateStick(interaction);
         } else if ("trigger".equals(hit.kind) || "pedal".equals(hit.kind)) {
             triggers.put(hit.id, 1f);
+        } else if ("steer".equals(hit.kind)) {
+            steerPointers.put(pointerId, hit.id);
+            startSteerRamp();
         } else if ("wheel".equals(hit.kind)) {
             wheelHeld = true;
             handler.removeCallbacks(wheelSpring);
@@ -269,6 +301,14 @@ public class TouchControlsView extends View {
             float delta = (interaction.downY - y) / Math.max(1f, bounds.height());
             float pressure = Math.max(0f, Math.min(1f, 1f + delta));
             triggers.put(control.id, pressure);
+        } else if ("steer".equals(control.kind)) {
+            TouchLayout.Control over = TouchRenderer.hitTest(layout.activeControls(), getWidth(),
+                    getHeight(), layout.scale, x, y);
+            if (over != null && "steer".equals(over.kind) && over != control) {
+                interaction.control = over;
+                steerPointers.put(interaction.pointerId, over.id);
+                startSteerRamp();
+            }
         } else if ("wheel".equals(control.kind)) {
             wheelValue = steerValue(bounds, x);
         } else if ("dpad".equals(control.kind)) {
@@ -286,6 +326,9 @@ public class TouchControlsView extends View {
             sticks.remove(control.id);
         } else if ("trigger".equals(control.kind) || "pedal".equals(control.kind)) {
             triggers.remove(control.id);
+        } else if ("steer".equals(control.kind)) {
+            steerPointers.remove(pointerId);
+            startSteerRamp();
         } else if ("wheel".equals(control.kind)) {
             wheelHeld = false;
             handler.postDelayed(wheelSpring, 16);
@@ -296,6 +339,25 @@ public class TouchControlsView extends View {
         }
         invalidate();
         updateNative();
+    }
+
+    private float steerTarget() {
+        boolean left = false, right = false;
+        for (String id : steerPointers.values()) {
+            if ("steer_left".equals(id)) {
+                left = true;
+            } else if ("steer_right".equals(id)) {
+                right = true;
+            }
+        }
+        return (right ? 1f : 0f) - (left ? 1f : 0f);
+    }
+
+    private void startSteerRamp() {
+        if (!steerTicking) {
+            steerTicking = true;
+            handler.post(steerRamp);
+        }
     }
 
     private boolean isControlInUse(TouchLayout.Control control) {
@@ -341,6 +403,7 @@ public class TouchControlsView extends View {
 
     private void clearInteractions() {
         pointers.clear();
+        steerPointers.clear();
         dpadBits.clear();
         sticks.clear();
         triggers.clear();

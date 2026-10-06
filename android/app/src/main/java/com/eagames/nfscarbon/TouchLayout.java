@@ -24,7 +24,7 @@ public class TouchLayout {
     public static final String DEFAULT_ASSET = "touch_layouts_default.json";
     public static final String LAYOUT_XBOX = "xbox";
     public static final String LAYOUT_DRIVING = "driving";
-    public static final int VERSION = 8;
+    public static final int VERSION = 9;
 
     public static final class Control {
         public String id = "";
@@ -275,10 +275,8 @@ public class TouchLayout {
         // Driving: Carbon's Xbox 360 defaults (manual): A handbrake, B nitrous,
         // X speedbreaker, Y crew, LB reset, RB change view, Back engage event.
         List<Control> driving = new ArrayList<>();
-        Control wheel = control("wheel", "wheel", 0.19f, 0.74f, 0f);
-        wheel.w = 0.34f;
-        wheel.h = 0.40f;
-        driving.add(wheel);
+        driving.add(control("steer_left", "steer", 0.09f, 0.72f, 0.16f));
+        driving.add(control("steer_right", "steer", 0.26f, 0.72f, 0.16f));
         driving.add(pedal("brake", "BRAKE", 0.76f, 0.70f, 0.13f, "lt"));
         driving.add(pedal("gas", "GAS", 0.91f, 0.66f, 0.15f, "rt"));
         driving.add(button("a", "E-BRAKE", 0.62f, 0.79f, 0.078f, 4096));

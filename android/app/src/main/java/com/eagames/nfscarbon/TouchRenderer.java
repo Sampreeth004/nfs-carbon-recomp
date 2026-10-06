@@ -63,6 +63,9 @@ public final class TouchRenderer {
         if ("pedal".equals(control.kind)) {
             return new RectF(cx - r * 0.72f, cy - r * 1.25f, cx + r * 0.72f, cy + r * 1.25f);
         }
+        if ("steer".equals(control.kind)) {
+            return new RectF(cx - r * 0.95f, cy - r * 1.05f, cx + r * 0.95f, cy + r * 1.05f);
+        }
         if (isPill(control)) {
             float hw = r * ("start".equals(control.id) || "back".equals(control.id) ? 1.3f : 1.75f);
             float hh = r * 0.78f;
@@ -90,7 +93,9 @@ public final class TouchRenderer {
                                    RectF bounds, float alpha, boolean pressed, boolean selected,
                                    float knobX, float knobY) {
         String kind = control.kind;
-        if ("wheel".equals(kind)) {
+        if ("steer".equals(kind)) {
+            drawSteerArrow(canvas, paint, control, bounds, alpha, pressed, selected);
+        } else if ("wheel".equals(kind)) {
             drawSteering(canvas, paint, bounds, alpha, pressed, selected, knobX);
         } else if ("pedal".equals(kind)) {
             drawPedal(canvas, paint, control, bounds, alpha, pressed, selected, knobY);
@@ -280,6 +285,23 @@ public final class TouchRenderer {
         float mw = dp(canvas, 5f);
         canvas.drawRoundRect(new RectF(mx - mw, b.top + b.height() * 0.14f, mx + mw,
                 b.bottom - b.height() * 0.14f), mw, mw, paint);
+    }
+
+    private static void drawSteerArrow(Canvas canvas, Paint paint, TouchLayout.Control control,
+                                       RectF b, float alpha, boolean pressed, boolean selected) {
+        float corner = Math.min(b.width(), b.height()) * 0.24f;
+        glass(canvas, paint, b, corner, alpha, pressed, selected, EDGE);
+        int side = "steer_left".equals(control.id) ? -1 : 1;
+        float cx = b.centerX(), cy = b.centerY();
+        float w = b.width() * 0.22f, h = b.height() * 0.24f;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(withAlpha(TEXT, alpha));
+        path.reset();
+        path.moveTo(cx + side * w, cy);
+        path.lineTo(cx - side * w * 0.55f, cy - h);
+        path.lineTo(cx - side * w * 0.55f, cy + h);
+        path.close();
+        canvas.drawPath(path, paint);
     }
 
     private static void drawPedal(Canvas canvas, Paint paint, TouchLayout.Control control,

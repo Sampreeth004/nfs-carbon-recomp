@@ -1,12 +1,13 @@
 {
-  "version": 8,
+  "version": 9,
   "active": "driving",
   "opacity": 0.85,
   "scale": 1.0,
   "deadzone": 0.08,
   "layouts": {
     "driving": [
-      {"id":"wheel","kind":"wheel",  "x":0.19,"y":0.74,"w":0.34,"h":0.40},
+      {"id":"steer_left", "kind":"steer","x":0.09,"y":0.72,"size":0.16},
+      {"id":"steer_right","kind":"steer","x":0.26,"y":0.72,"size":0.16},
       {"id":"brake","kind":"pedal",  "x":0.76,"y":0.70,"size":0.13,"label":"BRAKE","axis":"lt"},
       {"id":"gas",  "kind":"pedal",  "x":0.91,"y":0.66,"size":0.15,"label":"GAS","axis":"rt"},
       {"id":"a",    "kind":"button", "x":0.62,"y":0.79,"size":0.078,"label":"E-BRAKE","bit":4096},

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Pipeline warm-up**: every pipeline the game uses is recorded to `<title>.pipelines` next to the
+  pipeline cache, with its shaders named by their SPIR-V cache key. On the next start they are all
+  queued to the pipeline workers before the first frame, so scenes seen before no longer stall or
+  pop in the first time they appear (PC: 78 pipelines queued in 5 ms). This is the same idea as the
+  reference port's saved pipeline list. No game shader data ships with the app; the list is built
+  on the player's own device.
+- **Pipeline cache saved while playing**: written in the background (throttled) and when the app
+  is paused, atomically (`.tmp` + rename). Before, it was written only at a clean exit or every 64
+  new pipelines, so on Android, where the app is usually killed, it was almost never kept.
+- **Shader modules shared**: identical translated shaders reuse one Vulkan module.
+- **Touch steering**: the steering slider is replaced by left and right arrow buttons. Steering
+  ramps in while an arrow is held, and you can slide a finger from one arrow to the other.
+
 ## 0.3.0 (2026-10-06): 60 fps on the phone, new audio and touch controls
 
 ### FPS and heat (Snapdragon 8 Elite / Adreno 830, in a race)

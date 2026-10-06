@@ -17,6 +17,10 @@ class ShaderCompiler {
   ~ShaderCompiler();
 
   void SetCacheDirectory(const std::filesystem::path& dir);
+  // Cache key of a GLSL source (also the name of its SPIR-V file).
+  static uint64_t KeyFor(const std::string& glsl);
+  // Reads the SPIR-V cached under `key`, if any.
+  bool LoadCached(uint64_t key, std::vector<uint32_t>& spirv);
 
   // Returns false and fills `error` if compilation fails.
   bool Compile(const std::string& glsl, bool vertex, std::vector<uint32_t>& spirv,

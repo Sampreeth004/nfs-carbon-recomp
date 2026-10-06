@@ -101,6 +101,9 @@ namespace carbon::gpu {
 
 using rex::ui::vulkan::VulkanDevice;
 
+constexpr uint32_t kWarmMagic = 0x4C575043;  // "CPWL"
+constexpr uint32_t kWarmVersion = 1;
+
 uint64_t HashBytes(const void* data, size_t size, uint64_t seed) {
   return XXH3_64bits_withSeed(data, size, seed);
 }
@@ -439,6 +442,31 @@ void Renderer::InitializeShaderStorage(const std::filesystem::path& cache_root,
   std::snprintf(name, sizeof(name), "%08X.%04X-%04X-%08X.vkpc", title_id, props.vendorID,
                 props.deviceID, props.driverVersion);
   pipeline_cache_path_ = dir / name;
+  {
+    char warm_name[32];
+    std::snprintf(warm_name, sizeof(warm_name), "%08X.pipelines", title_id);
+    warm_path_ = dir / warm_name;
+    std::ifstream warm(warm_path_, std::ios::binary | std::ios::ate);
+    if (warm) {
+      std::vector<uint8_t> data(size_t(warm.tellg()));
+      warm.seekg(0);
+      warm.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size()));
+      uint32_t header[3] = {};
+      if (data.size() >= sizeof(header)) {
+        std::memcpy(header, data.data(), sizeof(header));
+      }
+      if (header[0] == kWarmMagic && header[1] == kWarmVersion &&
+          header[2] == sizeof(PipelineKey) &&
+          (data.size() - sizeof(header)) % sizeof(PipelineKey) == 0) {
+        std::lock_guard<std::mutex> lock(warm_mutex_);
+        warm_records_.assign(data.begin() + sizeof(header), data.end());
+        for (size_t i = 0; i < warm_records_.size(); i += sizeof(PipelineKey)) {
+          warm_seen_.insert(HashBytes(warm_records_.data() + i, sizeof(PipelineKey)));
+        }
+        warmup_pending_ = true;
+      }
+    }
+  }
   std::ifstream in(pipeline_cache_path_, std::ios::binary | std::ios::ate);
   if (in && pipelines_.empty()) {
     std::vector<char> data(size_t(in.tellg()));
@@ -473,8 +501,18 @@ void Renderer::SavePipelineCache() {
   }
   std::error_code ec;
   std::filesystem::create_directories(pipeline_cache_path_.parent_path(), ec);
-  std::ofstream out(pipeline_cache_path_, std::ios::binary);
-  out.write(data.data(), std::streamsize(size));
+  // Written aside and renamed, so a kill mid-write never leaves a broken cache.
+  std::filesystem::path temp = pipeline_cache_path_;
+  temp += ".tmp";
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    out.write(data.data(), std::streamsize(size));
+    if (!out) {
+      return;
+    }
+  }
+  std::filesystem::rename(temp, pipeline_cache_path_, ec);
+  REXGPU_INFO("[carbon-gpu] saved pipeline cache ({} KiB)", size >> 10);
 }
 
 void Renderer::Shutdown() {
@@ -551,6 +589,9 @@ bool Renderer::BeginFrame() {
   dfn.vkResetDescriptorPool(vk_device_, f.descriptor_pool, 0);
   texture_set_cache_.clear();
   cmd_ = CmdCache();
+  if (warmup_pending_.exchange(false)) {
+    RunPipelineWarmup();
+  }
   cube_face_in_frame_ = 0;
   skip_resolve_rt_ = nullptr;
   dfn.vkResetCommandPool(vk_device_, f.pool, 0);
@@ -904,6 +945,14 @@ Shader* Renderer::LoadShader(xenos::ShaderType type, const uint32_t* guest_be,
 
 VkShaderModule Renderer::CreateModuleFromGlsl(const std::string& glsl, bool vertex,
                                               const char* what) {
+  const uint64_t module_key = ShaderCompiler::KeyFor(glsl);
+  {
+    std::lock_guard<std::mutex> lock(module_mutex_);
+    auto it = modules_by_key_.find(module_key);
+    if (it != modules_by_key_.end()) {
+      return it->second;
+    }
+  }
   std::vector<uint32_t> spirv;
   std::string error;
   if (!compiler_->Compile(glsl, vertex, spirv, error)) {
@@ -922,7 +971,130 @@ VkShaderModule Renderer::CreateModuleFromGlsl(const std::string& glsl, bool vert
   ci.pCode = spirv.data();
   VkShaderModule module = VK_NULL_HANDLE;
   dfn.vkCreateShaderModule(vk_device_, &ci, nullptr, &module);
+  if (module) {
+    std::lock_guard<std::mutex> lock(module_mutex_);
+    modules_by_key_[module_key] = module;
+    module_keys_[module] = module_key;
+  }
   return module;
+}
+
+VkShaderModule Renderer::ModuleForKey(uint64_t key) {
+  {
+    std::lock_guard<std::mutex> lock(module_mutex_);
+    auto it = modules_by_key_.find(key);
+    if (it != modules_by_key_.end()) {
+      return it->second;
+    }
+  }
+  std::vector<uint32_t> spirv;
+  if (!compiler_->LoadCached(key, spirv)) {
+    return VK_NULL_HANDLE;
+  }
+  VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  ci.codeSize = spirv.size() * 4;
+  ci.pCode = spirv.data();
+  VkShaderModule module = VK_NULL_HANDLE;
+  vulkan_device_->functions().vkCreateShaderModule(vk_device_, &ci, nullptr, &module);
+  if (module) {
+    std::lock_guard<std::mutex> lock(module_mutex_);
+    modules_by_key_[key] = module;
+    module_keys_[module] = key;
+  }
+  return module;
+}
+
+static_assert(sizeof(VkShaderModule) == sizeof(uint64_t), "module keys replace the handles");
+
+void Renderer::RecordWarmPipeline(const PipelineKey& key) {
+  PipelineKey record = key;
+  {
+    std::lock_guard<std::mutex> lock(module_mutex_);
+    auto vs = module_keys_.find(key.vs);
+    auto ps = module_keys_.find(key.ps);
+    if (vs == module_keys_.end() || ps == module_keys_.end()) {
+      return;
+    }
+    std::memcpy(&record.vs, &vs->second, sizeof(uint64_t));
+    std::memcpy(&record.ps, &ps->second, sizeof(uint64_t));
+  }
+  uint64_t hash = HashBytes(&record, sizeof(record));
+  std::lock_guard<std::mutex> lock(warm_mutex_);
+  if (!warm_seen_.insert(hash).second) {
+    return;
+  }
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&record);
+  warm_records_.insert(warm_records_.end(), bytes, bytes + sizeof(record));
+  warm_dirty_ = true;
+  pipeline_cache_dirty_ = true;
+}
+
+void Renderer::SaveWarmList() {
+  std::vector<uint8_t> records;
+  {
+    std::lock_guard<std::mutex> lock(warm_mutex_);
+    if (!warm_dirty_ || warm_path_.empty()) {
+      return;
+    }
+    warm_dirty_ = false;
+    records = warm_records_;
+  }
+  uint32_t header[3] = {kWarmMagic, kWarmVersion, uint32_t(sizeof(PipelineKey))};
+  std::filesystem::path temp = warm_path_;
+  temp += ".tmp";
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(records.data()), std::streamsize(records.size()));
+    if (!out) {
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp, warm_path_, ec);
+}
+
+void Renderer::RunPipelineWarmup() {
+  std::vector<uint8_t> records;
+  {
+    std::lock_guard<std::mutex> lock(warm_mutex_);
+    records = warm_records_;
+  }
+  const size_t count = records.size() / sizeof(PipelineKey);
+  uint32_t queued = 0, missing = 0;
+  const double start = NowSeconds();
+  for (size_t i = 0; i < count; ++i) {
+    PipelineKey key;
+    std::memcpy(&key, records.data() + i * sizeof(PipelineKey), sizeof(key));
+    uint64_t vs_key, ps_key;
+    std::memcpy(&vs_key, &key.vs, sizeof(uint64_t));
+    std::memcpy(&ps_key, &key.ps, sizeof(uint64_t));
+    VkShaderModule vs = ModuleForKey(vs_key);
+    VkShaderModule ps = ModuleForKey(ps_key);
+    if (!vs || !ps) {
+      ++missing;
+      continue;
+    }
+    key.vs = vs;
+    key.ps = ps;
+    uint64_t hash = HashBytes(&key, sizeof(key));
+    VkPipelineLayout layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    if (pipelines_.count(hash)) {
+      continue;
+    }
+    if (pipeline_workers_.empty()) {
+      pipelines_.emplace(hash, BuildPipeline(key, layout));
+    } else {
+      pipelines_.emplace(hash, VK_NULL_HANDLE);
+      pipeline_jobs_.push_back({std::make_shared<PipelineKey>(key), layout, hash});
+      pipeline_cv_.notify_one();
+    }
+    ++queued;
+  }
+  REXGPU_INFO("[carbon-gpu] pipeline warm-up: {} pipelines queued from earlier sessions "
+              "({} without cached shaders), {:.0f} ms",
+              queued, missing, (NowSeconds() - start) * 1000.0);
 }
 
 static void DumpGlsl(uint64_t hash, const char* suffix, const std::string& glsl) {
@@ -1011,6 +1183,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
       return it->second;  // VK_NULL_HANDLE while a worker is still building it
     }
     if (!pipeline_workers_.empty()) {
+      RecordWarmPipeline(key);
       // Built off the command thread: the draws that need it are skipped for
       // the few frames it takes, instead of the whole frame stalling.
       pipelines_.emplace(hash, VK_NULL_HANDLE);
@@ -1021,6 +1194,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
       return VK_NULL_HANDLE;
     }
   }
+  RecordWarmPipeline(key);
   VkPipeline pipeline =
       BuildPipeline(key, GetPipelineLayout(key.vs_textures, key.ps_textures));
   ++stats_.pipelines_created;
@@ -1029,9 +1203,7 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
     std::lock_guard<std::mutex> lock(pipeline_mutex_);
     pipelines_.emplace(hash, pipeline);
   }
-  if ((stats_.pipelines_created & 63) == 0) {
-    SavePipelineCache();
-  }
+  pipeline_cache_dirty_ = true;
   return pipeline;
 }
 
@@ -1048,9 +1220,32 @@ void Renderer::PipelineWorker() {
       pipeline_jobs_.pop_front();
     }
     VkPipeline pipeline = BuildPipeline(*job.key, job.layout);
-    std::lock_guard<std::mutex> lock(pipeline_mutex_);
-    pipelines_[job.hash] = pipeline;
+    bool idle;
+    {
+      std::lock_guard<std::mutex> lock(pipeline_mutex_);
+      pipelines_[job.hash] = pipeline;
+      idle = pipeline_jobs_.empty();
+    }
+    pipeline_cache_dirty_ = true;
+    if (idle) {
+      SavePipelineCacheIfDue(3.0);
+    }
   }
+}
+
+void Renderer::SavePipelineCacheIfDue(double min_interval) {
+  if (!pipeline_cache_dirty_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pipeline_cache_save_mutex_);
+  double now = NowSeconds();
+  if (now - pipeline_cache_saved_at_ < min_interval) {
+    return;
+  }
+  pipeline_cache_dirty_ = false;
+  pipeline_cache_saved_at_ = now;
+  SavePipelineCache();
+  SaveWarmList();
 }
 
 VkPipeline Renderer::BuildPipeline(const PipelineKey& key, VkPipelineLayout layout) {
@@ -2412,6 +2607,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
 
 void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t width,
                     uint32_t height, const GammaRamp& gamma) {
+  if (g_paused.load(std::memory_order_acquire)) {
+    SavePipelineCacheIfDue(0.0);
+  }
   while (g_paused.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     cap_next_ = 0.0;

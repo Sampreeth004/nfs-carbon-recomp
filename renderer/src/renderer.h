@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <thread>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/ui/vulkan/api.h>
@@ -253,6 +255,24 @@ class Renderer {
   VkPipeline GetPipeline(const PipelineKey& key);
   VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout);
   void PipelineWorker();
+  void SavePipelineCacheIfDue(double min_interval);
+
+  // Pipeline warm-up: the pipelines used in earlier sessions are recorded (with
+  // shader modules named by their SPIR-V cache key) and rebuilt on the workers
+  // at start, so the first time a scene appears costs nothing.
+  VkShaderModule ModuleForKey(uint64_t key);
+  void RecordWarmPipeline(const PipelineKey& key);
+  void RunPipelineWarmup();
+  void SaveWarmList();
+  std::mutex module_mutex_;
+  std::unordered_map<uint64_t, VkShaderModule> modules_by_key_;
+  std::unordered_map<VkShaderModule, uint64_t> module_keys_;
+  std::mutex warm_mutex_;
+  std::vector<uint8_t> warm_records_;
+  std::unordered_set<uint64_t> warm_seen_;
+  bool warm_dirty_ = false;
+  std::atomic<bool> warmup_pending_{false};
+  std::filesystem::path warm_path_;
   struct PipelineJob {
     std::shared_ptr<PipelineKey> key;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -263,6 +283,11 @@ class Renderer {
   std::deque<PipelineJob> pipeline_jobs_;
   std::vector<std::thread> pipeline_workers_;
   bool pipeline_stop_ = false;
+  // The driver's pipeline cache is written shortly after new pipelines appear
+  // (sessions usually end by the app being killed, never by a clean shutdown).
+  std::mutex pipeline_cache_save_mutex_;
+  std::atomic<bool> pipeline_cache_dirty_{false};
+  double pipeline_cache_saved_at_ = 0.0;
   void SavePipelineCache();
 
   // ---- Draw helpers ----
