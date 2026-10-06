@@ -396,6 +396,20 @@ class Renderer {
   };
   bool bloom_enabled_ = true;
   int32_t fps_cap_ = 0;
+
+#if defined(__ANDROID__)
+  // ADPF (Android Dynamic Performance Framework): hint session that tells the
+  // OS scheduler how long frames take and what the target is, so it can scale
+  // clocks down on light frames instead of running flat-out (reduces heat).
+  // Loaded at runtime via dlopen so the binary runs on all Android versions;
+  // on devices that don't have the API it's a no-op.
+  bool adpf_init_tried_ = false;
+  int32_t adpf_last_cap_ = -1;
+  void* adpf_session_ = nullptr;
+  int (*adpf_report_fn_)(void*, int64_t) = nullptr;
+  int (*adpf_update_fn_)(void*, int64_t) = nullptr;
+  void InitAdpf();
+#endif
   // Secondary views on a budget (car reflection cube faces, rear-view mirror):
   // throttled passes skip their draws and the resolve that follows, so the
   // texture keeps the previous update.

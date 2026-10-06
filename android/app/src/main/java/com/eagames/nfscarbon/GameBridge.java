@@ -33,6 +33,15 @@ public final class GameBridge {
 
     public static native void nativeSetGamePaused(boolean paused);
 
+    // Generic cvar setter: allows Java-side code (e.g. thermal downgrade) to
+    // change any renderer setting at runtime without a per-cvar JNI function.
+    public static native void nativeSetCvar(String name, String value);
+
+    public static void setCvar(String name, String value) {
+        if (!nativeAvailable) return;
+        try { nativeSetCvar(name, value); } catch (UnsatisfiedLinkError ignored) {}
+    }
+
     public static void setGamePaused(boolean paused) {
         if (!nativeAvailable) {
             return;

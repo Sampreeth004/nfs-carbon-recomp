@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.2 (2026-10-06): ADPF performance hint and thermal auto-downgrade
+
+- **ADPF performance hint** (Android 13+ devices): the rendering thread reports
+  its actual frame time to Android's scheduler each frame. The OS can then lower
+  clock speeds when frames are easy and raise them when they are not, instead of
+  running maximum clocks all the time. Expected result: less heat, similar fps.
+  Loaded via `dlopen` so the APK runs unchanged on older Android versions.
+- **Thermal auto-downgrade**: `PowerManager.getThermalHeadroom` is polled every
+  2.5 s while playing. If the phone is heading toward throttling (headroom ≤ 0.5)
+  the fps cap drops to 45; at critically hot (≤ 0.15) it drops to 30. When the
+  phone cools back down (headroom > 0.85) the cap is restored to the setting in
+  Settings. A brief toast shows the change. This keeps frames smooth instead of
+  the phone applying an uncontrolled throttle.
+- **Renderer fps cap re-read each frame** so any runtime cvar change takes effect
+  immediately (needed for thermal downgrade; also allows hot-changing the cap
+  from the TOML without restarting).
+- **Generic JNI cvar setter** (`GameBridge.setCvar`) lets Java code change any
+  renderer setting at runtime.
+
 ## 0.3.1 (2026-10-06): pipeline warm-up and arrow steering
 
 - **Pipeline warm-up**: every pipeline the game uses is recorded to `<title>.pipelines` next to the

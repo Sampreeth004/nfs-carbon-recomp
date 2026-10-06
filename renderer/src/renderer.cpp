@@ -11,6 +11,10 @@
 #include <fstream>
 #include <thread>
 #include <type_traits>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/system/gpu_plugin.h>
@@ -484,6 +488,48 @@ void Renderer::InitializeShaderStorage(const std::filesystem::path& cache_root,
     }
   }
 }
+
+#if defined(__ANDROID__)
+void Renderer::InitAdpf() {
+  // libandroid.so is always loaded; RTLD_NOLOAD avoids a dlopen ref count.
+  void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+  if (!lib) {
+    lib = dlopen("libandroid.so", RTLD_NOW);  // fallback: load it ourselves
+    if (!lib) return;
+  }
+
+  using GetManagerFn    = void* (*)(void);
+  using CreateSessionFn = void* (*)(void*, const int32_t*, size_t, int64_t);
+
+  const auto get_mgr    = reinterpret_cast<GetManagerFn>(dlsym(lib, "APerformanceHint_getManager"));
+  const auto create_ses = reinterpret_cast<CreateSessionFn>(dlsym(lib, "APerformanceHintManager_createSession"));
+  adpf_report_fn_       = reinterpret_cast<decltype(adpf_report_fn_)>(
+      dlsym(lib, "APerformanceHintSession_reportActualWorkDuration"));
+  adpf_update_fn_       = reinterpret_cast<decltype(adpf_update_fn_)>(
+      dlsym(lib, "APerformanceHintSession_updateTargetWorkDuration"));
+
+  if (!get_mgr || !create_ses || !adpf_report_fn_ || !adpf_update_fn_) {
+    // API < 33, or symbols not present — no-op gracefully.
+    adpf_report_fn_ = nullptr;
+    adpf_update_fn_ = nullptr;
+    return;
+  }
+
+  void* mgr = get_mgr();
+  if (!mgr) return;
+
+  // Target: fps_cap_ if set, otherwise 60 fps as a reasonable default.
+  const int64_t target_ns = fps_cap_ > 0 ? int64_t(1e9 / fps_cap_) : int64_t(16'666'667LL);
+  const int32_t tid = static_cast<int32_t>(gettid());
+  adpf_session_ = create_ses(mgr, &tid, 1, target_ns);
+  adpf_last_cap_ = fps_cap_;
+
+  if (adpf_session_) {
+    REXGPU_INFO("[carbon-gpu] ADPF hint session created (target {:.2f} ms, tid {})",
+                double(target_ns) / 1e6, tid);
+  }
+}
+#endif
 
 void Renderer::SavePipelineCache() {
   if (pipeline_cache_path_.empty() || !pipeline_cache_) {
@@ -2614,6 +2660,20 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     cap_next_ = 0.0;
   }
+  // Re-read fps_cap_ each frame so thermal auto-downgrade (or any runtime
+  // cvar change) takes effect immediately without needing a restart.
+  fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
+
+#if defined(__ANDROID__)
+  // Lazy ADPF init: called on the rendering thread so gettid() gives the
+  // right TID.  Must happen after the first fps_cap_ read above.
+  if (!adpf_init_tried_) {
+    adpf_init_tried_ = true;
+    InitAdpf();
+  }
+  const double adpf_work_start = NowSeconds();
+#endif
+
   struct Timer {
     double& total;
     double start = NowSeconds();
@@ -2727,6 +2787,23 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
              front->resolved_swap_rb);
     vmaDestroyBuffer(allocator_, dump_buffer, dump_allocation);
   }
+
+#if defined(__ANDROID__)
+  // Report actual work duration to ADPF *before* the fps cap sleep, so the
+  // scheduler sees the real cost, not the artificial idle.
+  if (adpf_session_ && adpf_report_fn_ && adpf_update_fn_) {
+    const int64_t actual_ns = std::max(int64_t(1'000'000LL),
+        int64_t((NowSeconds() - adpf_work_start) * 1e9));
+    adpf_report_fn_(adpf_session_, actual_ns);
+    // Update target if the fps cap changed (e.g. thermal downgrade).
+    if (fps_cap_ != adpf_last_cap_) {
+      adpf_last_cap_ = fps_cap_;
+      const int64_t target_ns = fps_cap_ > 0
+          ? int64_t(1e9 / fps_cap_) : int64_t(16'666'667LL);
+      adpf_update_fn_(adpf_session_, target_ns);
+    }
+  }
+#endif
 
   // Frame rate cap: hold the command thread so the guest sees steady pacing and
   // the SoC is not driven faster than needed.

@@ -3,9 +3,11 @@ package com.eagames.nfscarbon;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.TypedValue;
 import android.view.View;
 import android.view.WindowManager;
@@ -22,6 +24,48 @@ public class GameActivity extends NfsCarbonActivity {
     private Button visibilityButton;
     private TextView fpsView;
 
+    // ---- Thermal auto-downgrade ----
+    // Polls Android's thermal headroom every ~2.5 s and drops the fps cap
+    // before the phone throttles itself, keeping frames smoother and cooler.
+    // 0 = user's setting; 1 = downgraded to 45; 2 = downgraded to 30.
+    private int thermalDowngradeLevel = 0;
+    private int userFpsCap = 60;
+    private int thermalTickCount = 0;
+    private static final int THERMAL_CHECK_EVERY_N_TICKS = 5; // every 2.5 s
+
+    private void checkThermal() {
+        if (Build.VERSION.SDK_INT < 29) return;
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (pm == null) return;
+        // getThermalHeadroom(5): headroom forecast 5 seconds ahead.
+        // 1.0 = comfortable, 0.5 = warm, 0.0 = critically hot.
+        float headroom;
+        try {
+            headroom = pm.getThermalHeadroom(5);
+        } catch (Exception e) {
+            return;
+        }
+        if (Float.isNaN(headroom)) return;
+
+        final int prevLevel = thermalDowngradeLevel;
+        if (headroom <= 0.15f && thermalDowngradeLevel < 2) {
+            thermalDowngradeLevel = 2;
+            GameBridge.setCvar("carbon_gpu_fps_cap", "30");
+        } else if (headroom <= 0.5f && thermalDowngradeLevel < 1) {
+            thermalDowngradeLevel = 1;
+            GameBridge.setCvar("carbon_gpu_fps_cap", "45");
+        } else if (headroom > 0.85f && thermalDowngradeLevel > 0) {
+            thermalDowngradeLevel = 0;
+            GameBridge.setCvar("carbon_gpu_fps_cap", String.valueOf(userFpsCap));
+        }
+        if (thermalDowngradeLevel != prevLevel && fpsView != null) {
+            String msg = thermalDowngradeLevel > 0
+                    ? "🌡 Thermal: fps capped to " + (thermalDowngradeLevel == 2 ? "30" : "45")
+                    : "🌡 Thermal: fps restored to " + userFpsCap;
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+        }
+    }
+
     private final Handler fpsHandler = new Handler(Looper.getMainLooper());
     private final Runnable fpsTick = new Runnable() {
         @Override
@@ -35,6 +79,12 @@ public class GameActivity extends NfsCarbonActivity {
                         fps, GameBridge.getGuestFrameMs(), GameBridge.getGuestWorstMs()));
             } else {
                 fpsView.setText("-- fps");
+            }
+            // Thermal check every THERMAL_CHECK_EVERY_N_TICKS ticks (every 2.5 s).
+            ++thermalTickCount;
+            if (thermalTickCount >= THERMAL_CHECK_EVERY_N_TICKS) {
+                thermalTickCount = 0;
+                checkThermal();
             }
             fpsHandler.postDelayed(this, 500);
         }
@@ -53,7 +103,8 @@ public class GameActivity extends NfsCarbonActivity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // The game never needs more than 60 Hz: asking the display for 60 Hz halves the
         // compositing work (and heat) on a 120 Hz panel.
-        if (GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60) != 0) {
+        userFpsCap = GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60);
+        if (userFpsCap != 0) {
             WindowManager.LayoutParams attributes = getWindow().getAttributes();
             attributes.preferredRefreshRate = 60.0f;
             getWindow().setAttributes(attributes);
@@ -196,5 +247,10 @@ public class GameActivity extends NfsCarbonActivity {
     protected void onResume() {
         super.onResume();
         GameBridge.setGamePaused(false);
+        // Reset thermal tracking when the app comes back; the user may have
+        // let the phone cool down.
+        thermalDowngradeLevel = 0;
+        thermalTickCount = 0;
+        userFpsCap = GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60);
     }
 }
