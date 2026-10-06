@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-10-06): pipeline warm-up and arrow steering
 
 - **Pipeline warm-up**: every pipeline the game uses is recorded to `<title>.pipelines` next to the
   pipeline cache, with its shaders named by their SPIR-V cache key. On the next start they are all
