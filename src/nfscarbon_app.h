@@ -10,6 +10,7 @@
 #include <string>
 
 #if defined(__ANDROID__)
+#include "android_aaudio.h"
 #include "thread_affinity.h"
 
 extern "C" const char* SDL_GetAndroidInternalStoragePath(void);
@@ -100,6 +101,10 @@ class NfsCarbonApp : public rex::ReXApp {
     if (config.gpu_plugin.empty()) {
       config.gpu_plugin = "carbon";
     }
+
+#if defined(__ANDROID__)
+    config.audio_factory = REX_AUDIO_BACKEND(carbon::audio::AAudioSystem);
+#endif
 
 #ifndef __ANDROID__
     // On Android the launcher writes these keys to the TOML config, and

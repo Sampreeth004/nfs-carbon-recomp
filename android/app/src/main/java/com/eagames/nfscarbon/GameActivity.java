@@ -51,6 +51,13 @@ public class GameActivity extends NfsCarbonActivity {
             return;
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // The game never needs more than 60 Hz: asking the display for 60 Hz halves the
+        // compositing work (and heat) on a 120 Hz panel.
+        if (GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60) != 0) {
+            WindowManager.LayoutParams attributes = getWindow().getAttributes();
+            attributes.preferredRefreshRate = 60.0f;
+            getWindow().setAttributes(attributes);
+        }
         createOverlay();
     }
 
@@ -177,5 +184,17 @@ public class GameActivity extends NfsCarbonActivity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    @Override
+    protected void onPause() {
+        GameBridge.setGamePaused(true);
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        GameBridge.setGamePaused(false);
     }
 }

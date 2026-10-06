@@ -144,7 +144,10 @@ void CommandProcessor::WorkerMain() {
           break;
         }
         if (++spins > 16) {
+          auto idle_start = std::chrono::steady_clock::now();
           rex::thread::Wait(write_ptr_event_.get(), false, std::chrono::milliseconds(2));
+          renderer_->NoteCpIdle(std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - idle_start).count());
         } else {
           rex::thread::MaybeYield();
         }
@@ -499,7 +502,10 @@ bool CommandProcessor::ExecuteType3(Reader& r, uint32_t packet) {
         }
         // The guest may be waiting for work we have queued but not submitted.
         renderer_->FlushForWait();
+        auto wait_start = std::chrono::steady_clock::now();
         WaitSleep(wait);
+        renderer_->NoteCpWait(std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wait_start).count());
       }
       return true;
     }

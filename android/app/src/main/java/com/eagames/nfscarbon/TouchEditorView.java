@@ -1,7 +1,6 @@
 package com.eagames.nfscarbon;
 
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
@@ -21,7 +20,6 @@ public class TouchEditorView extends View {
     }
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Map<String, Bitmap> icons = new HashMap<>();
     private TouchLayout layout;
     private String layoutName = TouchLayout.LAYOUT_XBOX;
     private String selectedId;
@@ -32,7 +30,6 @@ public class TouchEditorView extends View {
     public TouchEditorView(Context context) {
         super(context);
         setBackgroundColor(0xFF10151C);
-        icons.putAll(TouchIcons.load(context));
     }
 
     public void setListener(Listener listener) {
@@ -114,9 +111,8 @@ public class TouchEditorView extends View {
         for (TouchLayout.Control control : controls) {
             RectF bounds = TouchRenderer.boundsOf(control, getWidth(), getHeight(), 1f);
             boolean selected = control.id.equals(selectedId);
-            Bitmap icon = control.icon.isEmpty() ? null : icons.get(control.icon);
             TouchRenderer.drawControl(canvas, paint, control, bounds, 1f, false, selected,
-                    0f, 0f, icon);
+                    0f, 0f);
         }
     }
 

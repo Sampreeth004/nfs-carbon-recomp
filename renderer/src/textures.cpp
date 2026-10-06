@@ -6,6 +6,7 @@
 // on the GPU and are found by their guest address.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include <rex/ui/vulkan/device.h>
@@ -128,6 +129,10 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
   t.depth = is_3d ? std::max<uint32_t>(g.depth >> g.mip_min_level, 1) : 1;
   t.layers = is_3d ? 1 : g.depth;
   t.levels = g.mip_max_level - g.mip_min_level + 1;
+  if (t.res_scale != 1.0f) {
+    t.width = std::max(1u, uint32_t(std::ceil(float(t.width) * t.res_scale)));
+    t.height = std::max(1u, uint32_t(std::ceil(float(t.height) * t.res_scale)));
+  }
   VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ici.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
   ici.format = t.format.host_format;
@@ -166,6 +171,19 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
 }
 
 void Renderer::UploadTexture(Texture& t) {
+  auto now = []() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  const double start = now();
+  struct Done {
+    Renderer* self;
+    double start;
+    double (*clock)();
+    ~Done() {
+      self->frame_texture_s_ += clock() - start;
+      ++self->frame_textures_;
+    }
+  } done{this, start, +now};
   std::vector<HostTextureRegion> regions;
   uint64_t size = GetHostTextureSize(t.guest, t.format, regions);
   if (!size || regions.empty()) {
@@ -233,7 +251,7 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
   for (auto it = range.first; it != range.second; ++it) {
     Texture* t = it->second.get();
     if (!t->resolved) continue;
-    if (width && (t->width < width || t->height < height)) continue;
+    if (width && (t->guest.width < width || t->guest.height < height)) continue;
     if (!best || t->last_used_frame > best->last_used_frame) {
       best = t;
     }
@@ -253,7 +271,7 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
   uint32_t strip_bytes = AlignUp(width, 32u) * 32 * bytes_per_texel;
   for (Texture* t : resolved_textures_) {
     uint32_t parent = t->guest.base_address;
-    if (parent >= base_address || t->guest.format != format || t->width != width) {
+    if (parent >= base_address || t->guest.format != format || t->guest.width != width) {
       continue;
     }
     uint32_t delta = base_address - parent;
@@ -264,7 +282,7 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
     // its 32-aligned height). Depth tiles keep the full height in the copy
     // registers, color tiles the remaining height; the copy is clamped anyway.
     uint32_t rows = delta / strip_bytes * 32;
-    if (rows < t->height) {
+    if (rows < t->guest.height) {
       y_offset = rows;
       t->last_used_frame = frame_number_;
       return t;
@@ -273,7 +291,8 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
   auto range = textures_.equal_range(base_address);
   for (auto it = range.first; it != range.second; ++it) {
     Texture* t = it->second.get();
-    if (t->resolved && t->guest.format == format && t->width == width && t->height == height) {
+    if (t->resolved && t->guest.format == format && t->guest.width == width &&
+        t->guest.height == height) {
       return t;
     }
   }
@@ -292,6 +311,7 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
     t->format = GetTextureFormatInfo(xenos::TextureFormat::k_8_8_8_8, bc_supported_);
   }
   t->format.host_format_signed = VK_FORMAT_UNDEFINED;
+  t->res_scale = res_scale_;
   if (!CreateTextureImage(*t, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
     return nullptr;
   }
@@ -390,7 +410,7 @@ VkImageView Renderer::GetTextureView(Texture& t, uint32_t swizzle, bool use_sign
 }
 
 VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
-                               const TextureBinding& binding) {
+                               const TextureBinding& binding, bool render_source) {
   auto pick = [](xenos::TextureFilter instr, xenos::TextureFilter fetch_value) {
     return instr == xenos::TextureFilter::kUseFetchConst ? fetch_value : instr;
   };
@@ -405,7 +425,8 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                  (uint64_t(fetch.clamp_z) << 6) | (uint64_t(mag) << 9) | (uint64_t(min) << 11) |
                  (uint64_t(mip) << 13) | (uint64_t(aniso) << 15) |
                  (uint64_t(fetch.border_color) << 18) | (uint64_t(lod_bias) << 20) |
-                 (uint64_t(fetch.mip_min_level) << 30) | (uint64_t(fetch.mip_max_level) << 34);
+                 (uint64_t(fetch.mip_min_level) << 30) | (uint64_t(fetch.mip_max_level) << 34) |
+                 (uint64_t(render_source) << 40);
   auto it = samplers_.find(key);
   if (it != samplers_.end()) {
     return it->second;
@@ -427,10 +448,16 @@ VkSampler Renderer::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
   sci.addressModeV = address(fetch.clamp_y);
   sci.addressModeW = address(fetch.clamp_z);
   sci.mipLodBias = float(int32_t(lod_bias << 22) >> 22) * (1.0f / 32.0f);
-  if (aniso != xenos::AnisoFilter::kDisabled && props.samplerAnisotropy) {
-    sci.anisotropyEnable = VK_TRUE;
+  // Render-to-texture sources (post-process, blurs) are never worth anisotropic
+  // taps; other textures are capped for the GPU's sake.
+  if (!render_source && aniso != xenos::AnisoFilter::kDisabled && props.samplerAnisotropy &&
+      max_anisotropy_ > 1.0f) {
     float max_aniso = float(1u << (uint32_t(aniso) - 1));
-    sci.maxAnisotropy = std::min(max_aniso, props.maxSamplerAnisotropy);
+    max_aniso = std::min({max_aniso, props.maxSamplerAnisotropy, max_anisotropy_});
+    if (max_aniso > 1.0f) {
+      sci.anisotropyEnable = VK_TRUE;
+      sci.maxAnisotropy = max_aniso;
+    }
   }
   sci.minLod = 0.0f;
   sci.maxLod = mip == xenos::TextureFilter::kBaseMap ? 0.0f : 16.0f;
@@ -451,7 +478,10 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
   if (!ts.texture_descriptor_count) {
     return;
   }
-  std::vector<VkDescriptorImageInfo> infos(ts.texture_descriptor_count);
+  constexpr uint32_t kMaxDescriptors = 64;
+  const uint32_t descriptor_count = std::min(ts.texture_descriptor_count, kMaxDescriptors);
+  VkDescriptorImageInfo infos[kMaxDescriptors];
+  std::memset(infos, 0, sizeof(VkDescriptorImageInfo) * descriptor_count);
   for (const TextureBinding& b : ts.textures) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(b.fetch_index);
     GuestTexture g;
@@ -460,7 +490,7 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
       t = GetTexture(g, true);
     }
     uint32_t fi = b.fetch_index;
-    VkSampler sampler = GetSampler(fetch, b);
+    VkSampler sampler = GetSampler(fetch, b, t && t->resolved);
     // Per-fetch-constant parameters for the shader.
     uint32_t signs_in[4] = {uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                             uint32_t(fetch.sign_w)};
@@ -490,8 +520,8 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
     c.tex_uv[fi * 4 + 0] = 1.0f;
     c.tex_uv[fi * 4 + 1] = 1.0f;
     if (t && t->resolved) {
-      c.tex_uv[fi * 4 + 0] = float(g.width) / float(t->width);
-      c.tex_uv[fi * 4 + 1] = float(g.height) / float(t->height);
+      c.tex_uv[fi * 4 + 0] = float(g.width) * t->res_scale / float(t->width);
+      c.tex_uv[fi * 4 + 1] = float(g.height) * t->res_scale / float(t->height);
     }
     if (t && t->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
       // Resolved textures are left readable after the copy; anything else is
@@ -540,15 +570,25 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
         break;
     }
   }
+  for (uint32_t i = 0; i < descriptor_count; ++i) {
+    if (!infos[i].imageView) {
+      infos[i] = {point_sampler_, null_2d_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    }
+  }
+  // Draws that bind the same textures and samplers share one descriptor set.
+  uint64_t cache_key = HashBytes(infos, sizeof(VkDescriptorImageInfo) * descriptor_count,
+                                 descriptor_count);
+  auto cached = texture_set_cache_.find(cache_key);
+  if (cached != texture_set_cache_.end()) {
+    set_out = cached->second;
+    return;
+  }
   VkDescriptorSet set = AllocateDescriptorSet(GetTextureSetLayout(ts.texture_descriptor_count));
   if (!set) {
     return;
   }
-  std::vector<VkWriteDescriptorSet> writes(infos.size());
-  for (uint32_t i = 0; i < infos.size(); ++i) {
-    if (!infos[i].imageView) {
-      infos[i] = {point_sampler_, null_2d_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    }
+  VkWriteDescriptorSet writes[kMaxDescriptors];
+  for (uint32_t i = 0; i < descriptor_count; ++i) {
     writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[i].dstSet = set;
     writes[i].dstBinding = i;
@@ -556,8 +596,9 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[i].pImageInfo = &infos[i];
   }
-  vulkan_device_->functions().vkUpdateDescriptorSets(vk_device_, uint32_t(writes.size()),
-                                                     writes.data(), 0, nullptr);
+  vulkan_device_->functions().vkUpdateDescriptorSets(vk_device_, descriptor_count, writes, 0,
+                                                     nullptr);
+  texture_set_cache_.emplace(cache_key, set);
   set_out = set;
 }
 

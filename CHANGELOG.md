@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.3.0 (2026-10-06): 60 fps on the phone, new audio and touch controls
+
+### FPS and heat (Snapdragon 8 Elite / Adreno 830, in a race)
+
+| | 0.2.0 | 0.3.0 |
+|---|---|---|
+| Frame rate | 20-40 fps, swinging, slow-motion feel | 56-60 fps (steady scenes 60) |
+| GPU time per frame | 34-49 ms | about 8 ms |
+| Renderer CPU per frame | 17-19 ms | about 9 ms |
+| Draws recorded per frame | about 2,500-3,000 | about 1,800-2,200 (+ ~600 throttled) |
+
+What made the difference, largest first:
+- **Bloom off by default on Android** (Settings: Bloom). Its blur chain (6-8 full-screen passes of
+  scattered texture reads) cost 23-38 ms of GPU per frame while driving, for a subtle glow.
+- **Pass render area**: passes cover only the rows the game resolves from a target; oversized
+  targets (640x3728 for a 640x360 buffer) no longer cost a full load and store per pass.
+- **Car reflections and mirror on a budget** (Settings: Car reflections, Rear-view mirror at half
+  rate; Android defaults 2 cube faces per frame and half rate). Throttled passes skip their draws and
+  their resolve, so the textures keep the previous update. About 600 fewer draws per frame.
+- **Draw recording**: redundant pipeline/viewport/scissor/stencil/descriptor calls skipped, texture
+  descriptor sets shared between draws, single-pass index conversion, no per-draw allocations, and
+  only the parts of the per-draw constants a shader reads are written.
+- **Game code** (Android): `tools/direct_calls.py` turns 142,521 calls between unhooked game
+  functions (and the PowerPC register save/restore helpers) into direct calls that can be inlined;
+  built with ThinLTO and `-march=armv8.2-a`. Run the script after every codegen.
+- **UI repaint**: the always-alive achievement toast kept the ImGui UI repainting at every display
+  refresh (~13% of the app's CPU). New `achievement_toasts` setting, off on Android
+  (`patches/rexglue-achievement-toasts.patch` for the SDK's `rex_app.cpp`).
+- **Async pipelines**: new pipelines are built on worker threads; draws needing one are skipped for
+  a frame or two instead of the frame stalling (`carbon_gpu_async_pipelines`).
+- **Frame rate cap** (Settings: 30/45/60/unlimited), a 60 Hz display request for the game window,
+  and the renderer and audio park while the app is in the background.
+- **Render resolution** (Settings: 100/85/75/60/50%, `carbon_gpu_render_scale`) for weaker GPUs:
+  render targets and resolved images are scaled, everything the game sees stays in guest pixels.
+- Texture filtering: anisotropy capped (4x on Android) and off for render-to-texture sources.
+- Vertex arena and LRU texture/render-target eviction (from 0.2.0 work) keep memory bounded.
+- Diagnostics: per-pass GPU timings with shader hashes, pacing stats, a slow-frame report
+  (draw time, texture uploads, pipelines, waits on the game), `carbon_gpu_debug_cycle`.
+
+### Audio
+- Android audio goes through a new AAudio stereo driver (`src/android_aaudio.*`): the phone reports
+  its speaker as 6 channels and the old 5.1 path lost the center channel, where the dialogue is. The
+  driver folds 5.1 to stereo itself with dialogue at full level and a limiter, uses a lock-free
+  ring, and reopens on headphone/route changes.
+- The runtime is built with Xenia Canary/Edge XMA decoder fixes (packets crossing input buffers, the
+  frame tail left undelivered, headers split across packets, loop starts), which stopped voices
+  stalling. These are applied to the local SDK tree, not part of this repository.
+
+### Touch controls
+- Reworked from scratch: controls are drawn from shapes (old PNG icons removed), dark glass style
+  with a cyan highlight, pedals that fill with pressure, a steering pad with chevrons.
+- Driving layout follows Carbon's Xbox 360 defaults and drops what is not needed while driving:
+  steering pad, GAS/BRAKE pedals, E-BRAKE (A), NOS (B), BREAKER (X), CREW (Y), RESET (LB), VIEW (RB),
+  EVENT (Back) and pause. Gamepad layout keeps every button for menus.
+
+### Fixed
+- Crash at start on Android: the installed SDK headers were older than the packaged runtime.
+- Colors: red/blue swap on the presented frame and double gamma on `k_8_8_8_8_GAMMA` targets.
+
 ## 0.2.0 (2026-10-06): native Vulkan renderer (`rexgpu-carbon`)
 
 A new GPU plugin, `renderer/`, that draws the game with Vulkan directly instead of emulating the

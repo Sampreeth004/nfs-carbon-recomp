@@ -5,6 +5,7 @@
 // that stands for the destination texture, and optionally clears it.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include <rex/ui/vulkan/device.h>
@@ -115,7 +116,9 @@ VkFormat Renderer::DepthTargetFormat(xenos::DepthRenderTargetFormat f) const {
   return f == xenos::DepthRenderTargetFormat::kD24FS8 ? VK_FORMAT_D32_SFLOAT_S8_UINT : d24s8;
 }
 
-bool Renderer::CreateRenderTargetImage(RenderTarget& rt, uint32_t width, uint32_t height) {
+bool Renderer::CreateRenderTargetImage(RenderTarget& rt, uint32_t logical_width,
+                                       uint32_t logical_height) {
+  const uint32_t width = Scaled(logical_width), height = Scaled(logical_height);
   const auto& dfn = vulkan_device_->functions();
   VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ici.imageType = VK_IMAGE_TYPE_2D;
@@ -151,6 +154,8 @@ bool Renderer::CreateRenderTargetImage(RenderTarget& rt, uint32_t width, uint32_
   dfn.vkCreateImageView(vk_device_, &vci, nullptr, &rt.sample_view);
   rt.width = width;
   rt.height = height;
+  rt.lw = logical_width;
+  rt.lh = logical_height;
   rt.layout = VK_IMAGE_LAYOUT_UNDEFINED;
   {
     uint32_t bpp = 4;
@@ -181,7 +186,7 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
   if (rt) {
     rt->last_used_frame = frame_number_;
   }
-  if (rt && rt->height >= min_height) {
+  if (rt && rt->lh >= min_height) {
     return rt;
   }
   uint32_t width = std::max<uint32_t>(pitch, 1);
@@ -199,13 +204,24 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
     }
     rt = created.get();
     rt->last_used_frame = frame_number_;
+    if (!depth) {
+      // Start black: passes that get skipped must resolve to nothing, not garbage.
+      EndRendering();
+      VkCommandBuffer ccb = frame().cb;
+      TransitionImage(ccb, rt->image, VK_IMAGE_ASPECT_COLOR_BIT, rt->layout,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      VkClearColorValue black = {};
+      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vulkan_device_->functions().vkCmdClearColorImage(
+          ccb, rt->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    }
     render_targets_.emplace(key, std::move(created));
     REXGPU_DEBUG("[carbon-gpu] new {} render target base {} pitch {} format {} -> {}x{}",
                  depth ? "depth" : "color", edram_base, pitch, format, width, height);
     return rt;
   }
   // Grow: keep the old contents (copied into the top of the new image).
-  height = std::max(height, rt->height + rt->height / 4);
+  height = std::max(height, rt->lh + rt->lh / 4);
   height = std::min<uint32_t>(AlignUp(height, 16), 8192);
   EndRendering();
   RenderTarget old = *rt;
@@ -224,7 +240,7 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
     VkImageCopy region = {};
     region.srcSubresource = {aspect, 0, 0, 1};
     region.dstSubresource = {aspect, 0, 0, 1};
-    region.extent = {old.width, std::min(old.height, height), 1};
+    region.extent = {std::min(old.width, rt->width), std::min(old.height, rt->height), 1};
     pfn_copy_image_(cb, old.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rt->image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
   }
@@ -369,6 +385,13 @@ VkPipeline Renderer::GetResolvePipeline(VkFormat dest_format, bool depth_source)
 }
 
 void Renderer::Resolve(const RegisterFile& regs) {
+  struct Timer {
+    double& total;
+    double start = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    ~Timer() {
+      total += std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - start;
+    }
+  } resolve_timer{stats_.resolve_s};
   using namespace rex::graphics;
   if (!BeginFrame()) {
     return;
@@ -462,6 +485,18 @@ void Renderer::Resolve(const RegisterFile& regs) {
     src = GetRenderTarget(false, ci.color_base, uint32_t(pitch), uint32_t(ci.color_format),
                           uint32_t(y1));
   }
+  bool skip_copy = false;
+  if (src) {
+    src->used_rows = std::max(src->used_rows, AlignUp(uint32_t(y1), 16));
+    if (!is_depth && src == skip_resolve_rt_) {
+      // Its draws were throttled this frame: keep the texture's previous update.
+      skip_copy = true;
+      skip_resolve_rt_ = nullptr;
+    }
+    if (!is_depth && src->pitch == 280) {
+      ++cube_face_in_frame_;
+    }
+  }
   auto dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
   auto dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
   uint32_t dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF;
@@ -495,12 +530,14 @@ void Renderer::Resolve(const RegisterFile& regs) {
     REXGPU_WARN("[carbon-gpu] trace: resolve into texture {:08X} at row {}",
                 dest->guest.base_address, dest_y_offset);
   }
-  if (src && dest) {
-    int32_t dy = int32_t(dest_y_offset);
-    int32_t dx0 = std::min<int32_t>(x0, int32_t(dest->width));
-    int32_t dy0 = std::min<int32_t>(y0 + dy, int32_t(dest->height));
-    int32_t dx1 = std::min<int32_t>(x1, int32_t(dest->width));
-    int32_t dy1 = std::min<int32_t>(y1 + dy, int32_t(dest->height));
+  if (src && dest && !skip_copy) {
+    // Host pixels: render targets and resolved images share the render scale.
+    const float rs = dest->res_scale;
+    int32_t dy = int32_t(std::lround(float(dest_y_offset) * rs));
+    int32_t dx0 = std::min<int32_t>(int32_t(std::floor(x0 * rs)), int32_t(dest->width));
+    int32_t dy0 = std::min<int32_t>(int32_t(std::floor(y0 * rs)) + dy, int32_t(dest->height));
+    int32_t dx1 = std::min<int32_t>(int32_t(std::ceil(x1 * rs)), int32_t(dest->width));
+    int32_t dy1 = std::min<int32_t>(int32_t(std::ceil(y1 * rs)) + dy, int32_t(dest->height));
     if (dx1 > dx0 && dy1 > dy0) {
       VkImageAspectFlags src_aspect =
           is_depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -552,6 +589,7 @@ void Renderer::Resolve(const RegisterFile& regs) {
       dfn.vkCmdSetScissor(cb, 0, 1, &sc);
       dfn.vkCmdDraw(cb, 3, 1, 0, 0);
       dfn.vkCmdEndRendering(cb);
+      GpuStamp(kTagResolve);
       TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, 1);
       dest->resolved = true;
@@ -569,13 +607,15 @@ void Renderer::Resolve(const RegisterFile& regs) {
     } else {
       pass.color[0] = rt;
     }
-    pass.width = rt->width;
-    pass.height = rt->height;
+    pass.width = rt->lw;
+    pass.height = rt->lh;
     BeginRendering(pass);
-    int32_t cx1 = std::min<int32_t>(x1, int32_t(rt->width));
-    int32_t cy1 = std::min<int32_t>(y1, int32_t(rt->height));
-    if (cx1 > x0 && cy1 > y0) {
-      VkClearRect rect = {{{x0, y0}, {uint32_t(cx1 - x0), uint32_t(cy1 - y0)}}, 0, 1};
+    int32_t cx0 = int32_t(std::floor(x0 * res_scale_));
+    int32_t cy0 = int32_t(std::floor(y0 * res_scale_));
+    int32_t cx1 = std::min<int32_t>(int32_t(std::ceil(x1 * res_scale_)), int32_t(rt->width));
+    int32_t cy1 = std::min<int32_t>(int32_t(std::ceil(y1 * res_scale_)), int32_t(rt->height));
+    if (cx1 > cx0 && cy1 > cy0) {
+      VkClearRect rect = {{{cx0, cy0}, {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0)}}, 0, 1};
       dfn.vkCmdClearAttachments(frame().cb, 1, &clear, 1, &rect);
     }
     EndRendering();

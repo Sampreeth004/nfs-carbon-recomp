@@ -202,6 +202,68 @@ public class SettingsActivity extends Activity {
         });
 
         switchRow("Vertical sync", GameConfig.KEY_VSYNC, true);
+        switchRow("Bloom / glow (heavy: heats the phone, costs fps)", GameConfig.KEY_BLOOM, false);
+        final String[] scaleLabels = {"100% (1280x720, sharpest)", "85% (1088x612)",
+                "75% (960x540, lighter)", "60% (768x432)", "50% (640x360, lightest)"};
+        final int[] scaleValues = {100, 85, 75, 60, 50};
+        int scaleStored = prefs.getInt(GameConfig.KEY_RENDER_SCALE, 100);
+        int scaleSelection = 0;
+        for (int i = 0; i < scaleValues.length; i++) {
+            if (scaleValues[i] == scaleStored) {
+                scaleSelection = i;
+            }
+        }
+        spinnerRow("Render resolution", scaleLabels, scaleSelection,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putInt(GameConfig.KEY_RENDER_SCALE, scaleValues[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+        final String[] capLabels = {"30 fps (coolest, steadiest)", "45 fps", "60 fps", "Unlimited"};
+        final int[] capValues = {30, 45, 60, 0};
+        int capSelection = 2;
+        int storedCap = prefs.getInt(GameConfig.KEY_FPS_CAP, 60);
+        for (int i = 0; i < capValues.length; i++) {
+            if (capValues[i] == storedCap) {
+                capSelection = i;
+            }
+        }
+        spinnerRow("Frame rate cap", capLabels, capSelection,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putInt(GameConfig.KEY_FPS_CAP, capValues[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+        final String[] reflLabels = {"Car reflections: full (6 faces per frame)",
+                "Car reflections: reduced (2 per frame)", "Car reflections: minimal (1 per frame)"};
+        final int[] reflValues = {6, 2, 1};
+        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 2);
+        int reflSelection = reflStored >= 6 ? 0 : (reflStored >= 2 ? 1 : 2);
+        spinnerRow("Car reflections", reflLabels, reflSelection,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putInt(GameConfig.KEY_REFLECTIONS, reflValues[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+        switchRow("Rear-view mirror at half rate (lighter)", GameConfig.KEY_MIRROR_HALF, true);
         switchRow("Letterbox presentation", GameConfig.KEY_LETTERBOX, true);
         switchRow("Occlusion queries (sun flares, lights)", GameConfig.KEY_OCCLUSION, true);
         switchRow("Single-pass scene (faster; requires MSAA off)",

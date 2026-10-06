@@ -4,12 +4,16 @@
 #include "renderer.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <thread>
 #include <type_traits>
 
 #include <rex/cvar.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xvideo.h>
@@ -49,6 +53,32 @@ REXCVAR_DEFINE_INT32(carbon_gpu_texture_budget_mb, 3072, "CarbonGPU",
                      "Texture memory above which least recently used textures are freed")
     .range(64, 16384);
 #endif
+#if defined(__ANDROID__)
+REXCVAR_DEFINE_INT32(carbon_gpu_max_anisotropy, 4, "CarbonGPU",
+                     "Cap on anisotropic filtering for guest textures (1 = off)")
+    .range(1, 16);
+#else
+REXCVAR_DEFINE_INT32(carbon_gpu_max_anisotropy, 16, "CarbonGPU",
+                     "Cap on anisotropic filtering for guest textures (1 = off)")
+    .range(1, 16);
+#endif
+REXCVAR_DEFINE_INT32(carbon_gpu_fps_cap, 0, "CarbonGPU",
+                     "Frame rate cap applied when the guest presents (0 = none)")
+    .range(0, 240);
+REXCVAR_DEFINE_INT32(carbon_gpu_reflection_faces, 6, "CarbonGPU",
+                     "Car reflection cube faces redrawn per frame (6 = all, every frame)")
+    .range(1, 6);
+REXCVAR_DEFINE_BOOL(carbon_gpu_mirror_half_rate, false, "CarbonGPU",
+                    "Redraw the rear-view mirror every other frame");
+REXCVAR_DEFINE_BOOL(carbon_gpu_bloom, true, "CarbonGPU",
+                    "Run the game's bloom blur passes (very heavy on phone GPUs)");
+REXCVAR_DEFINE_BOOL(carbon_gpu_async_pipelines, true, "CarbonGPU",
+                    "Build new pipelines on worker threads (draws needing them are skipped until ready)");
+REXCVAR_DEFINE_INT32(carbon_gpu_render_scale, 100, "CarbonGPU",
+                     "Render resolution in percent of the game's (100 = native 1280x720)")
+    .range(25, 200);
+REXCVAR_DEFINE_BOOL(carbon_gpu_debug_cycle, false, "CarbonGPU",
+                    "Debug: every 10 s cycle between normal, skipping small post passes, skipping the main scene, and both");
 REXCVAR_DEFINE_BOOL(carbon_gpu_dump_shaders, false, "CarbonGPU",
                     "Write the generated GLSL of every translated shader to <cache>/carbon_gpu/glsl");
 
@@ -56,6 +86,16 @@ REXCVAR_DEFINE_BOOL(carbon_gpu_dump_shaders, false, "CarbonGPU",
 // librexruntime.so: the app's fps overlay reads these through the JNI bridge.
 extern "C" void rex_gpu_report_fps(float fps, float frame_ms, float worst_ms);
 #endif
+
+namespace carbon::gpu {
+std::atomic<bool> g_paused{false};
+}  // namespace carbon::gpu
+
+// Called by the app when it goes to the background: the command thread parks at
+// the next frame, so the game, the GPU and the SoC go quiet until it returns.
+extern "C" REX_GPU_PLUGIN_EXPORT void carbon_gpu_set_paused(int paused) {
+  carbon::gpu::g_paused.store(paused != 0, std::memory_order_release);
+}
 
 namespace carbon::gpu {
 
@@ -100,6 +140,93 @@ void WriteBmp(const std::string& path, const uint8_t* rgba, uint32_t width, uint
     f.write(reinterpret_cast<const char*>(row.data()), std::streamsize(row.size()));
   }
   REXGPU_INFO("[carbon-gpu] saved {}", path);
+}
+
+// Guest index conversion: byte swap, primitive restart mapping and min/max in one
+// vectorizable pass.
+template <bool kSwap, bool kRestart>
+void ConvertIndices16Impl(const uint16_t* in, uint16_t* out, uint32_t count, uint16_t reset,
+                          uint32_t& lo_out, uint32_t& hi_out) {
+  uint16_t lo = 0xFFFF, hi = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint16_t v = in[i];
+    if (kSwap) v = __builtin_bswap16(v);
+    if (kRestart) {
+      const bool is_reset = v == reset;
+      out[i] = is_reset ? uint16_t(0xFFFF) : v;
+      lo = std::min(lo, is_reset ? uint16_t(0xFFFF) : v);
+      hi = std::max(hi, is_reset ? uint16_t(0) : v);
+    } else {
+      out[i] = v;
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+  }
+  lo_out = lo;
+  hi_out = hi;
+}
+
+void ConvertIndices16(const uint8_t* src, uint16_t* out, uint32_t count, bool swap, bool restart,
+                      uint32_t reset, uint32_t& lo, uint32_t& hi) {
+  const uint16_t* in = reinterpret_cast<const uint16_t*>(src);
+  const uint16_t r = uint16_t(reset);
+  if (swap) {
+    restart ? ConvertIndices16Impl<true, true>(in, out, count, r, lo, hi)
+            : ConvertIndices16Impl<true, false>(in, out, count, r, lo, hi);
+  } else {
+    restart ? ConvertIndices16Impl<false, true>(in, out, count, r, lo, hi)
+            : ConvertIndices16Impl<false, false>(in, out, count, r, lo, hi);
+  }
+}
+
+template <int kMode, bool kRestart>
+void ConvertIndices32Impl(const uint32_t* in, uint32_t* out, uint32_t count, uint32_t reset,
+                          uint32_t& lo_out, uint32_t& hi_out) {
+  uint32_t lo = 0xFFFFFFFFu, hi = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t v = in[i];
+    if (kMode == 1) {
+      v = ((v << 8) & 0xFF00FF00u) | ((v >> 8) & 0x00FF00FFu);
+    } else if (kMode == 2) {
+      v = __builtin_bswap32(v);
+    } else if (kMode == 3) {
+      v = (v >> 16) | (v << 16);
+    }
+    v &= 0xFFFFFF;
+    if (kRestart) {
+      const bool is_reset = v == reset;
+      out[i] = is_reset ? 0xFFFFFFFFu : v;
+      lo = std::min(lo, is_reset ? 0xFFFFFFFFu : v);
+      hi = std::max(hi, is_reset ? 0u : v);
+    } else {
+      out[i] = v;
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+  }
+  lo_out = lo;
+  hi_out = hi;
+}
+
+void ConvertIndices32(const uint8_t* src, uint32_t* out, uint32_t count, xenos::Endian endian,
+                      bool restart, uint32_t reset, uint32_t& lo, uint32_t& hi) {
+  const uint32_t* in = reinterpret_cast<const uint32_t*>(src);
+#define CARBON_CONV32(mode)                                                            restart ? ConvertIndices32Impl<mode, true>(in, out, count, reset, lo, hi)                    : ConvertIndices32Impl<mode, false>(in, out, count, reset, lo, hi)
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      CARBON_CONV32(1);
+      break;
+    case xenos::Endian::k8in32:
+      CARBON_CONV32(2);
+      break;
+    case xenos::Endian::k16in32:
+      CARBON_CONV32(3);
+      break;
+    default:
+      CARBON_CONV32(0);
+      break;
+  }
+#undef CARBON_CONV32
 }
 
 double NowSeconds() {
@@ -163,6 +290,12 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
   ubo_alignment_ = std::max<VkDeviceSize>(props.minUniformBufferOffsetAlignment, 16);
   storage_alignment_ = std::max<VkDeviceSize>(props.minStorageBufferOffsetAlignment, 16);
   texture_budget_bytes_ = uint64_t(REXCVAR_GET(carbon_gpu_texture_budget_mb)) << 20;
+  max_anisotropy_ = float(REXCVAR_GET(carbon_gpu_max_anisotropy));
+  res_scale_ = float(REXCVAR_GET(carbon_gpu_render_scale)) / 100.0f;
+  bloom_enabled_ = REXCVAR_GET(carbon_gpu_bloom);
+  fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
+  reflection_faces_ = REXCVAR_GET(carbon_gpu_reflection_faces);
+  mirror_half_rate_ = REXCVAR_GET(carbon_gpu_mirror_half_rate);
   chunk_size_ = VkDeviceSize(REXCVAR_GET(carbon_gpu_upload_chunk_mb)) << 20;
   chunk_size_ = std::min<VkDeviceSize>(chunk_size_, props.maxStorageBufferRange);
 
@@ -245,8 +378,33 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
   }
 
   {
+    const auto& ifn = vulkan_device_->vulkan_instance()->functions();
+    VkPhysicalDeviceProperties pdp = {};
+    ifn.vkGetPhysicalDeviceProperties(vulkan_device_->physical_device(), &pdp);
+    ts_period_ns_ = pdp.limits.timestampPeriod;
+    pfn_write_timestamp_ = reinterpret_cast<PFN_vkCmdWriteTimestamp>(
+        ifn.vkGetDeviceProcAddr(vk_device_, "vkCmdWriteTimestamp"));
+    pfn_get_query_results_ = reinterpret_cast<PFN_vkGetQueryPoolResults>(
+        ifn.vkGetDeviceProcAddr(vk_device_, "vkGetQueryPoolResults"));
+    if (ts_period_ns_ > 0.0f && pfn_write_timestamp_ && pfn_get_query_results_) {
+      for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = kMaxStamps;
+        if (dfn.vkCreateQueryPool(vk_device_, &qci, nullptr, &ts_pool_[i]) != VK_SUCCESS) {
+          ts_pool_[i] = VK_NULL_HANDLE;
+        }
+      }
+    }
+  }
+  {
     VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     dfn.vkCreatePipelineCache(vk_device_, &ci, nullptr, &pipeline_cache_);
+  }
+  if (REXCVAR_GET(carbon_gpu_async_pipelines)) {
+    for (int i = 0; i < 2; ++i) {
+      pipeline_workers_.emplace_back([this]() { PipelineWorker(); });
+    }
   }
 
   compiler_ = std::make_unique<ShaderCompiler>();
@@ -332,6 +490,15 @@ void Renderer::Shutdown() {
     for (auto& fn : f.deferred_destroy) fn();
     f.deferred_destroy.clear();
   }
+  {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    pipeline_stop_ = true;
+  }
+  pipeline_cv_.notify_all();
+  for (std::thread& worker : pipeline_workers_) {
+    worker.join();
+  }
+  pipeline_workers_.clear();
   SavePipelineCache();
   // The process is exiting; the device and allocator die with the provider.
 }
@@ -355,9 +522,12 @@ bool Renderer::BeginFrame() {
   const auto& dfn = vulkan_device_->functions();
   Frame& f = frame();
   if (f.submitted) {
+    double t0 = NowSeconds();
     dfn.vkWaitForFences(vk_device_, 1, &f.fence, VK_TRUE, UINT64_MAX);
+    stats_.fence_s += NowSeconds() - t0;
     dfn.vkResetFences(vk_device_, 1, &f.fence);
     f.submitted = false;
+    ReadGpuStamps(frame_index_);
   }
   if (arena_reset_pending_) {
     // The arena is full: wait until no frame in flight reads it, then start over.
@@ -379,11 +549,21 @@ bool Renderer::BeginFrame() {
   }
   f.chunks.clear();
   dfn.vkResetDescriptorPool(vk_device_, f.descriptor_pool, 0);
+  texture_set_cache_.clear();
+  cmd_ = CmdCache();
+  cube_face_in_frame_ = 0;
+  skip_resolve_rt_ = nullptr;
   dfn.vkResetCommandPool(vk_device_, f.pool, 0);
   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   dfn.vkBeginCommandBuffer(f.upload_cb, &bi);
   dfn.vkBeginCommandBuffer(f.cb, &bi);
+  ts_count_[frame_index_] = 0;
+  ts_valid_[frame_index_] = false;
+  if (ts_pool_[frame_index_]) {
+    dfn.vkCmdResetQueryPool(f.cb, ts_pool_[frame_index_], 0, kMaxStamps);
+    GpuStamp(kTagStart);
+  }
   f.number = frame_number_;
   frame_open_ = true;
   tracing_ = REXCVAR_GET(carbon_gpu_trace_frame) > 0 &&
@@ -412,6 +592,8 @@ void Renderer::EndFrame(bool present, const std::function<void(VkCommandBuffer)>
   if (present && present_fn) {
     present_fn(f.cb);
   }
+  GpuStamp(kTagEnd);
+  ts_valid_[frame_index_] = true;
   dfn.vkEndCommandBuffer(f.upload_cb);
   dfn.vkEndCommandBuffer(f.cb);
   VkCommandBuffer cbs[2] = {f.upload_cb, f.cb};
@@ -553,11 +735,76 @@ void Renderer::EndRendering() {
     return;
   }
   vulkan_device_->functions().vkCmdEndRendering(frame().cb);
+  StampInfo info;
+  info.width = current_pass_.width;
+  info.height = current_pass_.height;
+  info.draws = pass_draws_;
+  info.ps_hash = pass_ps_hash_;
+  info.vs_hash = pass_vs_hash_;
+  info.depth = current_pass_.depth != nullptr;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (current_pass_.color[i]) {
+      ++info.colors;
+      if (!info.format) info.format = uint32_t(current_pass_.color[i]->format);
+    }
+  }
+  pass_draws_ = 0;
+  GpuStamp(current_pass_.depth ? kTagScenePass : kTagOtherPass, &info);
   rendering_ = false;
   current_pass_ = PassState();
 }
 
+void Renderer::GpuStamp(GpuTag tag, const StampInfo* info) {
+  VkQueryPool pool = ts_pool_[frame_index_];
+  uint32_t& n = ts_count_[frame_index_];
+  if (!pool || n >= kMaxStamps) {
+    return;
+  }
+  pfn_write_timestamp_(frame().cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, pool, n);
+  ts_tag_[frame_index_][n] = tag;
+  ts_info_[frame_index_][n] = info ? *info : StampInfo();
+  ++n;
+}
+
+void Renderer::ReadGpuStamps(uint32_t slot) {
+  VkQueryPool pool = ts_pool_[slot];
+  uint32_t n = ts_count_[slot];
+  if (!pool || !ts_valid_[slot] || n < 2) {
+    return;
+  }
+  uint64_t results[kMaxStamps];
+  if (pfn_get_query_results_(vk_device_, pool, 0, n, sizeof(uint64_t) * n, results,
+                             sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  double total = double(results[n - 1] - results[0]) * ts_period_ns_ * 1e-9;
+  if (total <= 0.0 || total > 1.0) {
+    return;
+  }
+  stats_.gpu_total_s += total;
+  ++stats_.gpu_frames;
+  for (uint32_t i = 1; i < n; ++i) {
+    double dt = double(results[i] - results[i - 1]) * ts_period_ns_ * 1e-9;
+    if (dt > 0.0 && dt < 1.0) {
+      stats_.gpu_tag_s[ts_tag_[slot][i]] += dt;
+      uint8_t tag = ts_tag_[slot][i];
+      if (tag == kTagScenePass || tag == kTagOtherPass) {
+        const StampInfo& si = ts_info_[slot][i];
+        uint64_t key = (uint64_t(si.width) << 44) ^ (uint64_t(si.height) << 28) ^
+                       (uint64_t(si.format) << 8) ^ (uint64_t(si.colors) << 4) ^ si.depth;
+        PassAgg& a = pass_agg_[key];
+        a.info = si;
+        a.seconds += dt;
+        a.draws += si.draws;
+        ++a.count;
+      }
+    }
+    stats_.gpu_passes += ts_tag_[slot][i] == kTagScenePass || ts_tag_[slot][i] == kTagOtherPass;
+  }
+}
+
 bool Renderer::BeginRendering(const PassState& pass) {
+  cmd_ = CmdCache();
   const auto& dfn = vulkan_device_->functions();
   VkCommandBuffer cb = frame().cb;
   VkRenderingAttachmentInfo color[4] = {};
@@ -586,7 +833,18 @@ bool Renderer::BeginRendering(const PassState& pass) {
     pass.depth->last_used_frame = frame_number_;
   }
   VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-  ri.renderArea = {{0, 0}, {pass.width, pass.height}};
+  uint32_t area_w = Scaled(pass.width), area_h = Scaled(pass.height);
+  for (RenderTarget* rt : pass.color) {
+    if (rt) {
+      area_w = std::min(area_w, rt->width);
+      area_h = std::min(area_h, rt->height);
+    }
+  }
+  if (pass.depth) {
+    area_w = std::min(area_w, pass.depth->width);
+    area_h = std::min(area_h, pass.depth->height);
+  }
+  ri.renderArea = {{0, 0}, {area_w, area_h}};
   ri.layerCount = 1;
   ri.colorAttachmentCount = 4;
   ri.pColorAttachments = color;
@@ -746,10 +1004,56 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
   // Hashed as raw bytes: no padding allowed.
   static_assert(std::has_unique_object_representations_v<PipelineKey>);
   uint64_t hash = HashBytes(&key, sizeof(key));
-  auto it = pipelines_.find(hash);
-  if (it != pipelines_.end()) {
-    return it->second;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    auto it = pipelines_.find(hash);
+    if (it != pipelines_.end()) {
+      return it->second;  // VK_NULL_HANDLE while a worker is still building it
+    }
+    if (!pipeline_workers_.empty()) {
+      // Built off the command thread: the draws that need it are skipped for
+      // the few frames it takes, instead of the whole frame stalling.
+      pipelines_.emplace(hash, VK_NULL_HANDLE);
+      pipeline_jobs_.push_back({std::make_shared<PipelineKey>(key),
+                                GetPipelineLayout(key.vs_textures, key.ps_textures), hash});
+      pipeline_cv_.notify_one();
+      ++stats_.pipelines_created;
+      return VK_NULL_HANDLE;
+    }
   }
+  VkPipeline pipeline =
+      BuildPipeline(key, GetPipelineLayout(key.vs_textures, key.ps_textures));
+  ++stats_.pipelines_created;
+  frame_pipeline_builds_++;
+  {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    pipelines_.emplace(hash, pipeline);
+  }
+  if ((stats_.pipelines_created & 63) == 0) {
+    SavePipelineCache();
+  }
+  return pipeline;
+}
+
+void Renderer::PipelineWorker() {
+  for (;;) {
+    PipelineJob job;
+    {
+      std::unique_lock<std::mutex> lock(pipeline_mutex_);
+      pipeline_cv_.wait(lock, [this] { return pipeline_stop_ || !pipeline_jobs_.empty(); });
+      if (pipeline_stop_) {
+        return;
+      }
+      job = pipeline_jobs_.front();
+      pipeline_jobs_.pop_front();
+    }
+    VkPipeline pipeline = BuildPipeline(*job.key, job.layout);
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    pipelines_[job.hash] = pipeline;
+  }
+}
+
+VkPipeline Renderer::BuildPipeline(const PipelineKey& key, VkPipelineLayout layout) {
   const auto& dfn = vulkan_device_->functions();
   VkPipelineShaderStageCreateInfo stages[2] = {};
   stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -842,17 +1146,12 @@ VkPipeline Renderer::GetPipeline(const PipelineKey& key) {
   ci.pDepthStencilState = &ds;
   ci.pColorBlendState = &cb;
   ci.pDynamicState = &dy;
-  ci.layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
+  ci.layout = layout;
   VkPipeline pipeline = VK_NULL_HANDLE;
   VkResult r = dfn.vkCreateGraphicsPipelines(vk_device_, pipeline_cache_, 1, &ci, nullptr, &pipeline);
   if (r != VK_SUCCESS) {
     REXGPU_ERROR("[carbon-gpu] vkCreateGraphicsPipelines failed: {}", int(r));
-    pipeline = VK_NULL_HANDLE;
-  }
-  ++stats_.pipelines_created;
-  pipelines_.emplace(hash, pipeline);
-  if ((stats_.pipelines_created & 63) == 0) {
-    SavePipelineCache();
+    return VK_NULL_HANDLE;
   }
   return pipeline;
 }
@@ -980,6 +1279,23 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
   y0 = std::clamp(y0, 0, int32_t(rt_height));
   x1 = std::clamp(x1, x0, int32_t(rt_width));
   y1 = std::clamp(y1, y0, int32_t(rt_height));
+  if (res_scale_ != 1.0f) {
+    // Guest pixels to host pixels; the NDC transform above is scale-free.
+    const float s = res_scale_;
+    viewport = {0.0f, 0.0f, w * s, h * s, 0.0f, 1.0f};
+    int32_t max_x = int32_t(Scaled(rt_width)), max_y = int32_t(Scaled(rt_height));
+    int32_t hx0 = std::min(int32_t(std::floor(x0 * s)), max_x);
+    int32_t hy0 = std::min(int32_t(std::floor(y0 * s)), max_y);
+    int32_t hx1 = std::clamp(int32_t(std::ceil(x1 * s)), hx0, max_x);
+    int32_t hy1 = std::clamp(int32_t(std::ceil(y1 * s)), hy0, max_y);
+    if (x1 == x0) hx1 = hx0;
+    if (y1 == y0) hy1 = hy0;
+    scissor = {{hx0, hy0}, {uint32_t(hx1 - hx0), uint32_t(hy1 - hy0)}};
+    // Param gen positions stay in guest pixels.
+    c.pixel_pos[0] = 1.0f / s;
+    c.pixel_pos[1] = 1.0f / s;
+    return;
+  }
   scissor = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
 }
 
@@ -1158,6 +1474,16 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
 }
 
 void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const DrawInfo& info) {
+  struct Timer {
+    double& total;
+    double start = NowSeconds();
+    ~Timer() { total += NowSeconds() - start; }
+  } draw_timer{stats_.draw_s};
+  struct FrameTimer {
+    double& total;
+    double start = NowSeconds();
+    ~FrameTimer() { total += NowSeconds() - start; }
+  } frame_draw_timer{frame_draw_s_};
   using namespace rex::graphics;
   if (!BeginFrame()) {
     return;
@@ -1229,6 +1555,21 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
       }
       Skip(kSkipPrimitive);
       return;
+    }
+  }
+
+  // The bloom blur chain is 6-8 full-screen passes of 8 scattered texture reads each;
+  // on phone GPUs they cost more than the whole scene for a subtle glow.
+  if (!bloom_enabled_ && ps) {
+    switch (ps->hash) {
+      case 0xF84B05E744D442E8ull:
+      case 0x2047A91B3C7E8F62ull:
+      case 0x56B15EE1C23228EEull:
+      case 0xA25318EF353C6AD7ull:
+        Skip(kSkipNoTarget);
+        return;
+      default:
+        break;
     }
   }
 
@@ -1331,15 +1672,57 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   }
   pass.width = UINT32_MAX;
   pass.height = UINT32_MAX;
+  uint32_t hinted_rows = UINT32_MAX;
   for (auto* c : pass.color) {
     if (c) {
-      pass.width = std::min(pass.width, c->width);
-      pass.height = std::min(pass.height, c->height);
+      pass.width = std::min(pass.width, c->lw);
+      pass.height = std::min(pass.height, c->lh);
+      if (c->used_rows) hinted_rows = std::min(hinted_rows, c->used_rows);
     }
   }
   if (pass.depth) {
-    pass.width = std::min(pass.width, pass.depth->width);
-    pass.height = std::min(pass.height, pass.depth->height);
+    pass.width = std::min(pass.width, pass.depth->lw);
+    pass.height = std::min(pass.height, pass.depth->lh);
+    if (pass.depth->used_rows) hinted_rows = std::min(hinted_rows, pass.depth->used_rows);
+  }
+  pass.height = std::min(pass.height, hinted_rows);
+
+  // Car reflection faces (280-pitch target with depth) and the mirror (640-pitch
+  // 8888 target with depth) can be updated less often than the main view.
+  if (pass.color[0] && pass.depth && !pass.color[1]) {
+    const RenderTarget* c0 = pass.color[0];
+    bool throttle = false;
+    if (c0->pitch == 280 && reflection_faces_ < 6) {
+      uint32_t face = cube_face_in_frame_ % 6;
+      uint32_t first = uint32_t((frame_number_ * uint64_t(reflection_faces_)) % 6);
+      throttle = (face + 6 - first) % 6 >= uint32_t(reflection_faces_);
+    } else if (mirror_half_rate_ && c0->pitch == 640 && c0->guest_format == 0 &&
+               (frame_number_ & 1)) {
+      throttle = true;
+    }
+    if (throttle) {
+      skip_resolve_rt_ = pass.color[0];
+      ++stats_.throttled;
+      Skip(kSkipNoTarget);
+      return;
+    }
+  }
+
+  // Debug cycle: 0 normal, 1 post passes with a 1-pixel scissor, 2 post passes with an
+  // empty pixel shader, 3 post passes skipped entirely.
+  bool debug_tiny = false, debug_null_ps = false;
+  if (REXCVAR_GET(carbon_gpu_debug_cycle)) {
+    uint32_t mode = uint32_t(NowSeconds() / 10.0) & 3;
+    debug_mode_ = mode;
+    bool small_pass = !pass.depth && pass.width <= 640;
+    if (small_pass) {
+      if (mode == 1) debug_tiny = true;
+      if (mode == 2) debug_null_ps = true;
+      if (mode == 3) {
+        Skip(kSkipNoTarget);
+        return;
+      }
+    }
   }
 
   // Shaders.
@@ -1367,6 +1750,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
                                      ? regs.Get<reg::SQ_CONTEXT_MISC>().param_gen_pos
                                      : 0;
     ps_module = GetPixelShaderModule(ps, ps_variant);
+    if (debug_null_ps) ps_module = null_ps_module_;
   }
   if (!vs_module || !ps_module) {
     Skip(kSkipModules);
@@ -1462,8 +1846,10 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   }
 
   // ---- Uploads (all in one chunk) ----
+  // Only the header is cleared: the per-fetch arrays are written for the entries
+  // the shaders use, and only those entries are uploaded.
   DrawConstants consts;
-  std::memset(&consts, 0, sizeof(consts));
+  std::memset(&consts, 0, offsetof(DrawConstants, vfetch));
   std::memcpy(consts.bools, &regs.values[kRegBoolConstants], sizeof(consts.bools));
   std::memcpy(consts.loops, &regs.values[kRegLoopConstants], sizeof(consts.loops));
   consts.vtx[1] = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
@@ -1476,14 +1862,12 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   consts.alpha_test[0] = regs.GetFloat(XE_GPU_REG_RB_ALPHA_REF);
   consts.alpha_test[1] = float(uint32_t(color_control.alpha_func));
   consts.alpha_test[2] = color_control.alpha_test_enable && pass.color[0] ? 1.0f : 0.0f;
-  for (uint32_t i = 0; i < 32; ++i) {
-    consts.tex_size[i * 4 + 3] = 1.0f;
-    consts.tex_uv[i * 4 + 0] = 1.0f;
-    consts.tex_uv[i * 4 + 1] = 1.0f;
-  }
   VkViewport viewport;
   VkRect2D scissor;
   ComputeViewport(regs, pass.width, pass.height, consts, viewport, scissor);
+  if (debug_tiny) {
+    scissor = {{0, 0}, {1, 1}};
+  }
   if (!scissor.extent.width || !scissor.extent.height) {
     Skip(kSkipScissor);
     return;
@@ -1537,27 +1921,53 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   };
   // The vertices the indices reach, so only that part of each buffer is copied.
   VertexRange vertex_range;
-  {
-    uint32_t index_offset_v = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
-    if (!info.indexed) {
-      vertex_range.known = count > 0;
-      vertex_range.min_index = index_offset_v;
-      vertex_range.max_index = index_offset_v + (count ? count - 1 : 0);
-    } else if (count) {
-      uint32_t lo_i = UINT32_MAX, hi_i = 0;
-      bool restart = key.primitive_restart != 0;
-      uint32_t reset_mask = info.index_format == xenos::IndexFormat::kInt16 ? 0xFFFF : 0xFFFFFF;
-      for (uint32_t i = 0; i < count; ++i) {
-        uint32_t v = read_index(i) & reset_mask;
-        if (restart && v == (reset_index & reset_mask)) continue;
-        lo_i = std::min(lo_i, v);
-        hi_i = std::max(hi_i, v);
-      }
-      if (lo_i <= hi_i) {
-        vertex_range.known = true;
-        vertex_range.min_index = lo_i + index_offset_v;
-        vertex_range.max_index = hi_i + index_offset_v;
-      }
+  bool indices_done = false;
+  const uint32_t index_offset_v = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
+  if (info.indexed && expand == Expand::kNone && count) {
+    // Plain indexed draw: convert straight into the upload buffer and take the
+    // vertex range from the same pass.
+    const bool is16 = info.index_format == xenos::IndexFormat::kInt16;
+    UploadAllocation a = Upload(VkDeviceSize(count) * (is16 ? 2 : 4) + 4, 16);
+    uint32_t lo = 0, hi = 0;
+    if (is16) {
+      bool swap = info.index_endian == xenos::Endian::k8in16 ||
+                  info.index_endian == xenos::Endian::k8in32;
+      ConvertIndices16(guest_indices, reinterpret_cast<uint16_t*>(a.ptr), count, swap,
+                       key.primitive_restart != 0, reset_index & 0xFFFF, lo, hi);
+      index_type = VK_INDEX_TYPE_UINT16;
+    } else {
+      ConvertIndices32(guest_indices, reinterpret_cast<uint32_t*>(a.ptr), count, info.index_endian,
+                       key.primitive_restart != 0, reset_index, lo, hi);
+      index_type = VK_INDEX_TYPE_UINT32;
+    }
+    index_buffer = a.buffer;
+    index_offset = a.offset;
+    host_indexed = true;
+    host_count = count;
+    indices_done = true;
+    if (lo <= hi) {
+      vertex_range.known = true;
+      vertex_range.min_index = lo + index_offset_v;
+      vertex_range.max_index = hi + index_offset_v;
+    }
+  } else if (!info.indexed) {
+    vertex_range.known = count > 0;
+    vertex_range.min_index = index_offset_v;
+    vertex_range.max_index = index_offset_v + (count ? count - 1 : 0);
+  } else if (count) {
+    uint32_t lo_i = UINT32_MAX, hi_i = 0;
+    bool restart = key.primitive_restart != 0;
+    uint32_t reset_mask = info.index_format == xenos::IndexFormat::kInt16 ? 0xFFFF : 0xFFFFFF;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t v = read_index(i) & reset_mask;
+      if (restart && v == (reset_index & reset_mask)) continue;
+      lo_i = std::min(lo_i, v);
+      hi_i = std::max(hi_i, v);
+    }
+    if (lo_i <= hi_i) {
+      vertex_range.known = true;
+      vertex_range.min_index = lo_i + index_offset_v;
+      vertex_range.max_index = hi_i + index_offset_v;
     }
   }
   if (!SetupVertexData(regs, vs, consts, vertex_range)) {
@@ -1567,7 +1977,9 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
       return;
     }
   }
-  if (expand == Expand::kRectList) {
+  if (indices_done) {
+    // Already converted above.
+  } else if (expand == Expand::kRectList) {
     uint32_t rects = count / 3;
     host_count = rects * 6;
     if (info.indexed) {
@@ -1577,7 +1989,8 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
       consts.vtx2[0] = uint32_t(a.offset / 4);
     }
   } else if (expand != Expand::kNone) {
-    std::vector<uint32_t> out;
+    std::vector<uint32_t>& out = scratch_indices_;
+    out.clear();
     if (expand == Expand::kQuadList) {
       uint32_t quads = count / 4;
       out.reserve(quads * 6);
@@ -1655,7 +2068,32 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   }
   {
     UploadAllocation a = Upload(sizeof(DrawConstants), ubo_alignment_);
-    std::memcpy(a.ptr, &consts, sizeof(consts));
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(&consts);
+    constexpr size_t kHead = offsetof(DrawConstants, vfetch);
+    std::memcpy(a.ptr, src, kHead);
+    // Vertex fetch slots up to the highest one the vertex shader uses.
+    uint32_t vfetch_count = 0;
+    for (int w = 2; w >= 0; --w) {
+      if (uint32_t bits = vs->translated.vfetch_used[w]) {
+        vfetch_count = uint32_t(w) * 32 + 32 - uint32_t(__builtin_clz(bits));
+        break;
+      }
+    }
+    std::memcpy(a.ptr + kHead, src + kHead, size_t(vfetch_count) * 2 * sizeof(uint32_t));
+    // Texture parameters for the fetch constants either shader samples.
+    uint32_t tex_mask = 0;
+    for (const TextureBinding& b : vs->translated.textures) tex_mask |= 1u << (b.fetch_index & 31);
+    if (ps) {
+      for (const TextureBinding& b : ps->translated.textures) tex_mask |= 1u << (b.fetch_index & 31);
+    }
+    while (tex_mask) {
+      uint32_t fi = uint32_t(__builtin_ctz(tex_mask));
+      tex_mask &= tex_mask - 1;
+      for (size_t field : {offsetof(DrawConstants, tex_size), offsetof(DrawConstants, tex_info),
+                           offsetof(DrawConstants, tex_uv)}) {
+        std::memcpy(a.ptr + field + fi * 16, src + field + fi * 16, 16);
+      }
+    }
     dyn_offsets[2] = uint32_t(a.offset);
   }
 
@@ -1681,21 +2119,48 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   }
   const auto& dfn = vulkan_device_->functions();
   VkCommandBuffer cb = frame().cb;
-  dfn.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  if (cmd_.pipeline != pipeline) {
+    dfn.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    cmd_.pipeline = pipeline;
+  }
+  ++pass_draws_;
+  pass_ps_hash_ = ps ? ps->hash : 0;
+  pass_vs_hash_ = vs->hash;
   VkPipelineLayout layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
   VkDescriptorSet set0 = upload_chunks_[current_chunk_].set0;
   dfn.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set0, 3,
                               dyn_offsets);
-  if (vs_set) {
+  // Texture sets stay bound while the set layouts they sit under are unchanged.
+  if (cmd_.layout != layout) {
+    if (cmd_.vs_textures != key.vs_textures) {
+      cmd_.set1 = cmd_.set2 = VK_NULL_HANDLE;
+    } else if (cmd_.ps_textures != key.ps_textures) {
+      cmd_.set2 = VK_NULL_HANDLE;
+    }
+    cmd_.layout = layout;
+    cmd_.vs_textures = key.vs_textures;
+    cmd_.ps_textures = key.ps_textures;
+  }
+  if (vs_set && cmd_.set1 != vs_set) {
     dfn.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &vs_set, 0,
                                 nullptr);
+    cmd_.set1 = vs_set;
   }
-  if (ps_set) {
+  if (ps_set && cmd_.set2 != ps_set) {
     dfn.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 2, 1, &ps_set, 0,
                                 nullptr);
+    cmd_.set2 = ps_set;
   }
-  dfn.vkCmdSetViewport(cb, 0, 1, &viewport);
-  dfn.vkCmdSetScissor(cb, 0, 1, &scissor);
+  if (!cmd_.viewport_valid || std::memcmp(&cmd_.viewport, &viewport, sizeof(viewport)) != 0) {
+    dfn.vkCmdSetViewport(cb, 0, 1, &viewport);
+    cmd_.viewport = viewport;
+    cmd_.viewport_valid = true;
+  }
+  if (!cmd_.scissor_valid || std::memcmp(&cmd_.scissor, &scissor, sizeof(scissor)) != 0) {
+    dfn.vkCmdSetScissor(cb, 0, 1, &scissor);
+    cmd_.scissor = scissor;
+    cmd_.scissor_valid = true;
+  }
   {
     float scale = 0.0f, offset = 0.0f;
     if (key.depth_bias) {
@@ -1707,27 +2172,48 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
       scale *= xenos::kPolygonOffsetScaleSubpixelUnit;
       offset *= float(1 << 24);
     }
-    dfn.vkCmdSetDepthBias(cb, offset, 0.0f, scale);
+    if (!cmd_.depth_bias_valid || cmd_.depth_bias[0] != offset || cmd_.depth_bias[1] != scale) {
+      dfn.vkCmdSetDepthBias(cb, offset, 0.0f, scale);
+      cmd_.depth_bias[0] = offset;
+      cmd_.depth_bias[1] = scale;
+      cmd_.depth_bias_valid = true;
+    }
   }
   {
     float blend[4] = {regs.GetFloat(XE_GPU_REG_RB_BLEND_RED), regs.GetFloat(XE_GPU_REG_RB_BLEND_GREEN),
                       regs.GetFloat(XE_GPU_REG_RB_BLEND_BLUE), regs.GetFloat(XE_GPU_REG_RB_BLEND_ALPHA)};
-    dfn.vkCmdSetBlendConstants(cb, blend);
+    if (!cmd_.blend_valid || std::memcmp(cmd_.blend, blend, sizeof(blend)) != 0) {
+      dfn.vkCmdSetBlendConstants(cb, blend);
+      std::memcpy(cmd_.blend, blend, sizeof(blend));
+      cmd_.blend_valid = true;
+    }
   }
-  {
+  if (pass.depth) {
     auto ref = regs.Get<reg::RB_STENCILREFMASK>();
     reg::RB_STENCILREFMASK ref_bf;
     ref_bf.value = regs[XE_GPU_REG_RB_STENCILREFMASK_BF];
     if (!depth_control.backface_enable) ref_bf = ref;
-    dfn.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, ref.stencilref);
-    dfn.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, ref_bf.stencilref);
-    dfn.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, ref.stencilmask);
-    dfn.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, ref_bf.stencilmask);
-    dfn.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, ref.stencilwritemask);
-    dfn.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, ref_bf.stencilwritemask);
+    uint32_t st[6] = {ref.stencilref,       ref_bf.stencilref,       ref.stencilmask,
+                      ref_bf.stencilmask,   ref.stencilwritemask,    ref_bf.stencilwritemask};
+    if (!cmd_.stencil_valid || std::memcmp(cmd_.stencil, st, sizeof(st)) != 0) {
+      dfn.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, st[0]);
+      dfn.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, st[1]);
+      dfn.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, st[2]);
+      dfn.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, st[3]);
+      dfn.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, st[4]);
+      dfn.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, st[5]);
+      std::memcpy(cmd_.stencil, st, sizeof(st));
+      cmd_.stencil_valid = true;
+    }
   }
   if (host_indexed) {
-    dfn.vkCmdBindIndexBuffer(cb, index_buffer, index_offset, index_type);
+    if (cmd_.index_buffer != index_buffer || cmd_.index_offset != index_offset ||
+        cmd_.index_type != index_type) {
+      dfn.vkCmdBindIndexBuffer(cb, index_buffer, index_offset, index_type);
+      cmd_.index_buffer = index_buffer;
+      cmd_.index_offset = index_offset;
+      cmd_.index_type = index_type;
+    }
     dfn.vkCmdDrawIndexed(cb, host_count, 1, 0, 0, 0);
   } else {
     dfn.vkCmdDraw(cb, host_count, 1, 0, 0);
@@ -1865,7 +2351,7 @@ void main() {
 }
 
 void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
-                             uint32_t source_height, VkImage dest, VkImageView dest_view,
+                             uint32_t source_height, float source_scale, VkImage dest, VkImageView dest_view,
                              uint32_t width, uint32_t height, bool dest_written_before, bool swap_rb) {
   const auto& dfn = vulkan_device_->functions();
   VkImageLayout dest_layout = dest_written_before
@@ -1910,8 +2396,8 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
       uint32_t swap_rb;
     } pc = {{1.0f / float(source_width), 1.0f / float(source_height)}, 1, swap_rb ? 1u : 0u};
     // The guest output may be smaller than the source image (padded resolves).
-    pc.scale[0] = float(width) / float(source_width) / float(width);
-    pc.scale[1] = float(height) / float(source_height) / float(height);
+    pc.scale[0] = source_scale / float(source_width);
+    pc.scale[1] = source_scale / float(source_height);
     dfn.vkCmdPushConstants(cb, present_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, &pc);
     VkViewport vp = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
     VkRect2D sc = {{0, 0}, {width, height}};
@@ -1926,6 +2412,15 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
 
 void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t width,
                     uint32_t height, const GammaRamp& gamma) {
+  while (g_paused.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    cap_next_ = 0.0;
+  }
+  struct Timer {
+    double& total;
+    double start = NowSeconds();
+    ~Timer() { total += NowSeconds() - start; }
+  } swap_timer{stats_.swap_s};
   if (!BeginFrame()) {
     return;
   }
@@ -1968,8 +2463,9 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     source_w = front->width;
     source_h = front->height;
   }
-  uint32_t out_w = width ? width : source_w;
-  uint32_t out_h = height ? height : source_h;
+  const float source_scale = front ? front->res_scale : 1.0f;
+  uint32_t out_w = width ? width : (front ? front->guest.width : source_w);
+  uint32_t out_h = height ? height : (front ? front->guest.height : source_h);
 
   // Frame dump (debugging): copy the front buffer to a readback buffer.
   VkBuffer dump_buffer = VK_NULL_HANDLE;
@@ -2013,7 +2509,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
                   context);
           context.SetIs8bpc(true);
           EndFrame(true, [&](VkCommandBuffer cb) {
-            RecordPresent(cb, source_view, source_w, source_h, vk_context.image(),
+            RecordPresent(cb, source_view, source_w, source_h, source_scale, vk_context.image(),
                           vk_context.image_view(), out_w, out_h,
                           vk_context.image_ever_written_previously(), front && front->resolved_swap_rb);
           });
@@ -2034,10 +2530,41 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     vmaDestroyBuffer(allocator_, dump_buffer, dump_allocation);
   }
 
+  // Frame rate cap: hold the command thread so the guest sees steady pacing and
+  // the SoC is not driven faster than needed.
+  if (fps_cap_ > 0) {
+    const double period = 1.0 / double(fps_cap_);
+    double t = NowSeconds();
+    if (cap_next_ == 0.0 || t - cap_next_ > period * 2.0) {
+      cap_next_ = t;
+    }
+    cap_next_ += period;
+    if (t < cap_next_) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(cap_next_ - t));
+    }
+  }
+
   // Statistics.
   ++stats_frames_;
   double now = NowSeconds();
+  if (overlay_last_swap_ > 0.0 && (now - overlay_last_swap_) * 1000.0 > 25.0 &&
+      REXCVAR_GET(carbon_gpu_stats) && spike_reports_ < 6) {
+    ++spike_reports_;
+    REXGPU_INFO(
+        "[carbon-gpu] slow frame {:.1f} ms: draws {:.1f} ms, texture uploads {} ({:.1f} ms), "
+        "pipelines built inline {}, cp idle {:.1f} ms, cp WAIT_REG_MEM {:.1f} ms",
+        (now - overlay_last_swap_) * 1000.0, frame_draw_s_ * 1000.0, frame_textures_,
+        frame_texture_s_ * 1000.0, frame_pipeline_builds_, frame_idle_s_ * 1000.0,
+        frame_wait_s_ * 1000.0);
+  }
+  frame_idle_s_ = frame_wait_s_ = frame_texture_s_ = frame_draw_s_ = 0;
+  frame_textures_ = frame_pipeline_builds_ = 0;
   if (overlay_last_swap_ > 0.0) {
+    double dt_ms = (now - overlay_last_swap_) * 1000.0;
+    stats_.worst_ms = std::max(stats_.worst_ms, dt_ms);
+    stats_.slow25 += dt_ms > 25.0;
+    stats_.slow34 += dt_ms > 34.0;
+    stats_.slow50 += dt_ms > 50.0;
     overlay_worst_ms_ = std::max(overlay_worst_ms_, (now - overlay_last_swap_) * 1000.0);
   } else {
     overlay_start_ = now;
@@ -2082,7 +2609,41 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
       }
       REXGPU_INFO("[carbon-gpu] skipped per frame:{}", reasons);
     }
+    if (REXCVAR_GET(carbon_gpu_stats)) {
+      double frames = double(std::max<uint64_t>(stats_frames_, 1));
+      REXGPU_INFO(
+          "[carbon-gpu] pacing(dbg mode {}): avg {:.1f} ms, worst {:.0f} ms, frames >25ms {} >34ms {} >50ms {} | "
+          "per frame ms: draw {:.2f}, resolve {:.2f}, swap {:.2f}, gpu fence wait {:.2f}",
+          debug_mode_, (now - stats_start_) * 1000.0 / frames, stats_.worst_ms, stats_.slow25, stats_.slow34,
+          stats_.slow50, stats_.draw_s * 1000.0 / frames, stats_.resolve_s * 1000.0 / frames,
+          stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
+      if (stats_.gpu_frames) {
+        std::vector<const PassAgg*> top;
+        for (auto& kv : pass_agg_) top.push_back(&kv.second);
+        std::sort(top.begin(), top.end(),
+                  [](const PassAgg* a, const PassAgg* b) { return a->seconds > b->seconds; });
+        double gf = double(stats_.gpu_frames);
+        for (size_t i = 0; i < top.size() && i < 8; ++i) {
+          const PassAgg& a = *top[i];
+          REXGPU_INFO(
+              "[carbon-gpu]   pass type {}x{} fmt {} colors {} depth {}: {:.2f} passes/frame, "
+              "{:.1f} draws/frame, {:.2f} ms/frame ({:.3f} ms each) ps {:016X} vs {:016X}",
+              a.info.width, a.info.height, a.info.format, a.info.colors, a.info.depth,
+              a.count / gf, a.draws / gf, a.seconds * 1000.0 / gf, a.seconds * 1000.0 / a.count,
+              a.info.ps_hash, a.info.vs_hash);
+        }
+        pass_agg_.clear();
+        double g = double(stats_.gpu_frames);
+        REXGPU_INFO(
+            "[carbon-gpu] gpu time per frame: total {:.1f} ms | scene passes {:.1f}, other passes {:.1f}, "
+            "resolves {:.1f}, present+tail {:.1f} (passes {:.0f})",
+            stats_.gpu_total_s * 1000.0 / g, stats_.gpu_tag_s[kTagScenePass] * 1000.0 / g,
+            stats_.gpu_tag_s[kTagOtherPass] * 1000.0 / g, stats_.gpu_tag_s[kTagResolve] * 1000.0 / g,
+            stats_.gpu_tag_s[kTagEnd] * 1000.0 / g, stats_.gpu_passes / g);
+      }
+    }
     stats_ = Stats();
+    spike_reports_ = 0;
     stats_frames_ = 0;
     stats_start_ = now;
   }

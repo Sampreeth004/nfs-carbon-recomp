@@ -6,6 +6,9 @@
 #pragma once
 
 #include <array>
+#include <cmath>
+#include <condition_variable>
+#include <thread>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -74,10 +77,14 @@ struct RenderTarget {
   VkImageView view = VK_NULL_HANDLE;           // attachment view
   VkImageView sample_view = VK_NULL_HANDLE;    // color: raw (UNORM) view; depth: depth aspect
   VkFormat format = VK_FORMAT_UNDEFINED;
-  uint32_t width = 0, height = 0;
+  uint32_t width = 0, height = 0;    // host image
+  uint32_t lw = 0, lh = 0;           // guest (logical) size
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint64_t last_used_frame = 0;
   uint64_t memory_bytes = 0;
+  // Rows the game actually resolves from this target. Passes only cover these,
+  // so oversized targets do not cost a full load and store per pass.
+  uint32_t used_rows = 0;
 };
 
 // A host image that holds guest texture data (decoded from memory, or the
@@ -98,6 +105,7 @@ struct Texture {
   uint64_t last_hash_frame = 0;
   uint32_t hash_interval = 1;
   bool resolved = false;            // Contents come from GPU resolves.
+  float res_scale = 1.0f;           // host pixels per guest pixel (render scale)
   bool resolved_swap_rb = false;    // Last resolve swapped red/blue (copy_dest_swap).
   uint64_t resolved_memory_hash = 0;  // Guest memory hash when last resolved.
   uint64_t last_used_frame = 0;
@@ -127,6 +135,10 @@ class Renderer {
   void Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t width, uint32_t height,
             const GammaRamp& gamma);
   void FlushForWait() {}
+  // Command processor time spent idle (ring empty) or in WAIT_REG_MEM, for the
+  // per-frame spike report.
+  void NoteCpIdle(double seconds) { frame_idle_s_ += seconds; }
+  void NoteCpWait(double seconds) { frame_wait_s_ += seconds; }
   void OnPrimaryBufferEnd() {}
 
   // Helpers shared by the parts of the renderer.
@@ -215,7 +227,8 @@ class Renderer {
   void UploadTexture(Texture& t);
   VkImageView GetTextureView(Texture& t, uint32_t swizzle, bool use_signed,
                              VkImageViewType view_type);
-  VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureBinding& binding);
+  VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureBinding& binding,
+                       bool render_source);
   void BindTextures(const RegisterFile& regs, Shader* shader, uint32_t set_index,
                     DrawConstants& constants, VkDescriptorSet& set_out);
   void CreateNullTextures();
@@ -238,6 +251,18 @@ class Renderer {
   VkPipelineLayout GetPipelineLayout(uint32_t vs_textures, uint32_t ps_textures);
   struct PipelineKey;
   VkPipeline GetPipeline(const PipelineKey& key);
+  VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout);
+  void PipelineWorker();
+  struct PipelineJob {
+    std::shared_ptr<PipelineKey> key;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    uint64_t hash = 0;
+  };
+  std::mutex pipeline_mutex_;
+  std::condition_variable pipeline_cv_;
+  std::deque<PipelineJob> pipeline_jobs_;
+  std::vector<std::thread> pipeline_workers_;
+  bool pipeline_stop_ = false;
   void SavePipelineCache();
 
   // ---- Draw helpers ----
@@ -278,7 +303,7 @@ class Renderer {
   // ---- Presentation ----
   bool CreatePresentPipeline();
   void RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
-                     uint32_t source_height, VkImage dest, VkImageView dest_view, uint32_t width,
+                     uint32_t source_height, float source_scale, VkImage dest, VkImageView dest_view, uint32_t width,
                      uint32_t height, bool dest_written_before, bool swap_rb);
   VkPipeline present_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout present_pipeline_layout_ = VK_NULL_HANDLE;
@@ -287,6 +312,85 @@ class Renderer {
   VmaAllocation gamma_allocation_ = VK_NULL_HANDLE;
   uint32_t* gamma_mapped_ = nullptr;
   VkSampler linear_sampler_ = VK_NULL_HANDLE;
+
+  // ---- GPU timing (timestamp queries, read back a few frames later) ----
+  enum GpuTag : uint8_t { kTagStart, kTagScenePass, kTagOtherPass, kTagResolve, kTagEnd, kTagCount };
+  static constexpr uint32_t kMaxStamps = 192;
+  struct StampInfo {
+    uint32_t width = 0, height = 0, format = 0, draws = 0;
+    uint64_t ps_hash = 0, vs_hash = 0;
+    uint8_t colors = 0;
+    bool depth = false;
+  };
+  struct PassAgg {
+    StampInfo info;
+    double seconds = 0;
+    uint32_t count = 0;
+    uint64_t draws = 0;
+  };
+  void GpuStamp(GpuTag tag, const StampInfo* info = nullptr);
+  StampInfo ts_info_[kFramesInFlight][kMaxStamps];
+  std::unordered_map<uint64_t, PassAgg> pass_agg_;
+  uint32_t pass_draws_ = 0;
+  uint32_t debug_mode_ = 0;
+  float max_anisotropy_ = 16.0f;
+  // Render resolution scale: host pixels per guest pixel for render targets and
+  // resolved images. Everything the game sees stays in guest pixels.
+  float res_scale_ = 1.0f;
+  uint32_t Scaled(uint32_t v) const {
+    return res_scale_ == 1.0f ? v : std::max(1u, uint32_t(std::ceil(float(v) * res_scale_)));
+  }
+
+  // State already set on the current command buffer, so repeated draws skip the
+  // redundant Vulkan calls. Reset whenever something else may have changed it.
+  struct CmdCache {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkViewport viewport = {};
+    VkRect2D scissor = {};
+    bool viewport_valid = false, scissor_valid = false;
+    float depth_bias[2] = {};
+    bool depth_bias_valid = false;
+    float blend[4] = {};
+    bool blend_valid = false;
+    uint32_t stencil[6] = {};
+    bool stencil_valid = false;
+    VkDescriptorSet set1 = VK_NULL_HANDLE, set2 = VK_NULL_HANDLE;
+    uint32_t vs_textures = UINT32_MAX, ps_textures = UINT32_MAX;
+    VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_offset = 0;
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+  } cmd_;
+  // Texture descriptor sets already built this frame, by binding contents.
+  std::unordered_map<uint64_t, VkDescriptorSet> texture_set_cache_;
+  std::vector<uint32_t> scratch_indices_;
+  // Fused index conversion for plain indexed draws: converts into the upload
+  // buffer and returns the range of vertex indices used.
+  struct IndexRange {
+    uint32_t lo = UINT32_MAX, hi = 0;
+  };
+  bool bloom_enabled_ = true;
+  int32_t fps_cap_ = 0;
+  // Secondary views on a budget (car reflection cube faces, rear-view mirror):
+  // throttled passes skip their draws and the resolve that follows, so the
+  // texture keeps the previous update.
+  int32_t reflection_faces_ = 6;
+  bool mirror_half_rate_ = false;
+  uint32_t cube_face_in_frame_ = 0;
+  RenderTarget* skip_resolve_rt_ = nullptr;
+  double cap_next_ = 0.0;
+  uint64_t pass_ps_hash_ = 0, pass_vs_hash_ = 0;
+  // Per-frame breakdown, reported for frames that miss 25 ms.
+  double frame_idle_s_ = 0, frame_wait_s_ = 0, frame_texture_s_ = 0, frame_draw_s_ = 0;
+  uint32_t frame_textures_ = 0, frame_pipeline_builds_ = 0, spike_reports_ = 0;
+  void ReadGpuStamps(uint32_t slot);
+  VkQueryPool ts_pool_[kFramesInFlight] = {};
+  uint32_t ts_count_[kFramesInFlight] = {};
+  uint8_t ts_tag_[kFramesInFlight][kMaxStamps] = {};
+  bool ts_valid_[kFramesInFlight] = {};
+  float ts_period_ns_ = 0.0f;
+  PFN_vkCmdWriteTimestamp pfn_write_timestamp_ = nullptr;
+  PFN_vkGetQueryPoolResults pfn_get_query_results_ = nullptr;
 
   // ---- State ----
   GpuSystem* system_ = nullptr;
@@ -354,7 +458,11 @@ class Renderer {
     uint32_t draws = 0, draws_skipped = 0, resolves = 0, passes = 0, pipelines_created = 0;
     uint32_t textures_uploaded = 0, shaders_compiled = 0;
     uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
-    uint32_t evicted = 0;
+    uint32_t evicted = 0, throttled = 0;
+    double draw_s = 0, resolve_s = 0, swap_s = 0, fence_s = 0, worst_ms = 0;
+    double gpu_total_s = 0, gpu_tag_s[5] = {};
+    uint32_t gpu_frames = 0, gpu_passes = 0;
+    uint32_t slow25 = 0, slow34 = 0, slow50 = 0;
     uint32_t skip[kSkipReasonCount] = {};
   } stats_;
   void Skip(SkipReason reason) {

@@ -1,7 +1,6 @@
 package com.eagames.nfscarbon;
 
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
@@ -40,7 +39,6 @@ public class TouchControlsView extends View {
     }
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Map<String, Bitmap> icons = new HashMap<>();
     private final Map<Integer, Interaction> pointers = new HashMap<>();
     private final Map<Integer, Integer> dpadBits = new HashMap<>();
     private final Map<String, float[]> sticks = new HashMap<>();
@@ -74,7 +72,6 @@ public class TouchControlsView extends View {
     public TouchControlsView(Context context) {
         super(context);
         layout = TouchLayout.load(context);
-        icons.putAll(TouchIcons.load(context));
         setFocusable(false);
         setFocusableInTouchMode(false);
     }
@@ -159,10 +156,14 @@ public class TouchControlsView extends View {
                 }
             } else if ("wheel".equals(control.kind)) {
                 knobX = wheelValue;
+            } else if ("pedal".equals(control.kind) || "trigger".equals(control.kind)) {
+                Float pressure = triggers.get(control.id);
+                knobY = pressure != null ? pressure : 0f;
             }
-            Bitmap icon = control.icon.isEmpty() ? null : icons.get(control.icon);
-            TouchRenderer.drawControl(canvas, paint, control, bounds, alpha,
-                    isControlPressed(control), false, knobX, knobY, icon);
+            boolean pressed = isControlPressed(control) || triggers.containsKey(control.id)
+                    || ("wheel".equals(control.kind) && wheelHeld);
+            TouchRenderer.drawControl(canvas, paint, control, bounds, alpha, pressed, false,
+                    knobX, knobY);
         }
     }
 
