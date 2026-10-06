@@ -84,6 +84,7 @@ class Translator {
   TranslatedShader Run();
 
  private:
+  uint32_t cur_vfetch_ = 96;
   bool is_vs() const { return type_ == xenos::ShaderType::kVertex; }
 
   void Line(const std::string& s) {
@@ -223,6 +224,11 @@ void Translator::EmitVertexFetch(const ucode::VertexFetchInstruction& vf) {
   if (!vf.is_mini_fetch()) {
     uint32_t fetch_index = vf.fetch_constant_index();
     result_.vfetch_used[fetch_index >> 5] |= 1u << (fetch_index & 31);
+    cur_vfetch_ = fetch_index;
+    result_.vfetch_stride[fetch_index] = std::max<uint32_t>(result_.vfetch_stride[fetch_index], vf.stride());
+    if (vf.src() != 0 || vf.is_src_relative() || (vf.src_swizzle() & 3) != 0 || vf.is_index_rounded()) {
+      result_.vfetch_computed[fetch_index >> 5] |= 1u << (fetch_index & 31);
+    }
     std::string src = TempRef(vf.src(), vf.is_src_relative());
     std::string index = fmt::format("{}.{}", src, kComp[vf.src_swizzle() & 3]);
     if (vf.is_index_rounded()) {
@@ -272,6 +278,10 @@ void Translator::EmitVertexFetch(const ucode::VertexFetchInstruction& vf) {
     return;
   }
   int32_t offset = vf.offset();
+  if (cur_vfetch_ < 96) {
+    result_.vfetch_extent[cur_vfetch_] =
+        std::max<uint32_t>(result_.vfetch_extent[cur_vfetch_], uint32_t(std::max(offset, 0)) + 4);
+  }
   auto word = [&](int32_t i) {
     return fmt::format("xe_vword(xe_vf_addr + {})", offset + i);
   };
@@ -1227,6 +1237,7 @@ std::string BuildVertexShaderGlsl(const TranslatedShader& vs, const VertexShader
   std::string g = "#version 450\n";
   g += kUniformDecls;
   g += "layout(std430, set = 0, binding = 3) readonly buffer XeVtx { uint d[]; } xe_vtx;\n";
+  g += "layout(std430, set = 0, binding = 4) readonly buffer XeArena { uint d[]; } xe_arena;\n";
   g += TextureDecls(vs, 1);
   g += kCommonHelpers;
   // Vertex words are stored as in guest memory (big-endian); swap per the
@@ -1255,7 +1266,7 @@ vec4 xe_e_misc;
   fn += "  xe_e_pos = vec4(0.0, 0.0, 0.0, 1.0);\n";
   fn += "  for (int i = 0; i < 16; ++i) xe_e_interp[i] = vec4(0.0);\n";
   fn += "  xe_e_misc = vec4(0.0);\n";
-  fn += "#define xe_vword(a) xe_swap(xe_vtx.d[max(a, 0)], xe_vf_endian)\n";
+  fn += "#define xe_vword(a) xe_swap(((xe_vf_endian & 0x80000000u) != 0u ? xe_arena.d[max(a, 0)] : xe_vtx.d[max(a, 0)]), xe_vf_endian & 3u)\n";
   fn += vs.body;
   fn += "#undef xe_vword\n";
   fn += "}\n";

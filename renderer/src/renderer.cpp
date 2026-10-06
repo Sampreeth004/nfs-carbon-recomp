@@ -32,8 +32,30 @@ REXCVAR_DEFINE_BOOL(carbon_gpu_stats, true, "CarbonGPU",
                     "Log renderer statistics (fps, draws, passes, uploads) every 5 seconds");
 REXCVAR_DEFINE_INT32(carbon_gpu_trace_frame, 0, "CarbonGPU",
                      "Log every pass, draw and resolve of this frame number (0 = off)");
+REXCVAR_DEFINE_INT32(carbon_gpu_dump_frame_interval, 0, "CarbonGPU",
+                     "Save the presented guest frame as carbon_frames/frame_<n>.bmp every N frames "
+                     "(0 = off)");
+REXCVAR_DEFINE_INT32(carbon_gpu_vertex_arena_mb, 128, "CarbonGPU",
+                     "Size of the persistent vertex buffer cache (0 = upload vertices every frame)")
+    .range(0, 1024);
+REXCVAR_DEFINE_BOOL(carbon_gpu_vertex_ranges, true, "CarbonGPU",
+                    "Copy only the part of a vertex buffer the draw's indices reach");
+#if defined(__ANDROID__)
+REXCVAR_DEFINE_INT32(carbon_gpu_texture_budget_mb, 640, "CarbonGPU",
+                     "Texture memory above which least recently used textures are freed")
+    .range(64, 8192);
+#else
+REXCVAR_DEFINE_INT32(carbon_gpu_texture_budget_mb, 3072, "CarbonGPU",
+                     "Texture memory above which least recently used textures are freed")
+    .range(64, 16384);
+#endif
 REXCVAR_DEFINE_BOOL(carbon_gpu_dump_shaders, false, "CarbonGPU",
                     "Write the generated GLSL of every translated shader to <cache>/carbon_gpu/glsl");
+
+#if defined(__ANDROID__)
+// librexruntime.so: the app's fps overlay reads these through the JNI bridge.
+extern "C" void rex_gpu_report_fps(float fps, float frame_ms, float worst_ms);
+#endif
 
 namespace carbon::gpu {
 
@@ -44,6 +66,41 @@ uint64_t HashBytes(const void* data, size_t size, uint64_t seed) {
 }
 
 namespace {
+
+// Writes RGBA8 pixels as a top-down 32-bit BMP.
+void WriteBmp(const std::string& path, const uint8_t* rgba, uint32_t width, uint32_t height, bool swap_rb) {
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    REXGPU_WARN("[carbon-gpu] could not write {}", path);
+    return;
+  }
+  uint32_t image_size = width * height * 4;
+  uint8_t header[54] = {'B', 'M'};
+  auto put32 = [&](uint32_t offset, uint32_t v) { std::memcpy(header + offset, &v, 4); };
+  put32(2, 54 + image_size);
+  put32(10, 54);
+  put32(14, 40);
+  put32(18, width);
+  put32(22, uint32_t(-int32_t(height)));
+  header[26] = 1;
+  header[28] = 32;
+  put32(34, image_size);
+  f.write(reinterpret_cast<const char*>(header), sizeof(header));
+  std::vector<uint8_t> row(size_t(width) * 4);
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* src = rgba + size_t(y) * width * 4;
+    for (uint32_t x = 0; x < width; ++x) {
+      row[x * 4 + 0] = src[x * 4 + (swap_rb ? 0 : 2)];
+      row[x * 4 + 1] = src[x * 4 + 1];
+      row[x * 4 + 2] = src[x * 4 + (swap_rb ? 2 : 0)];
+      row[x * 4 + 3] = 255;
+    }
+    f.write(reinterpret_cast<const char*>(row.data()), std::streamsize(row.size()));
+  }
+  REXGPU_INFO("[carbon-gpu] saved {}", path);
+}
 
 double NowSeconds() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
@@ -105,6 +162,7 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
   }
   ubo_alignment_ = std::max<VkDeviceSize>(props.minUniformBufferOffsetAlignment, 16);
   storage_alignment_ = std::max<VkDeviceSize>(props.minStorageBufferOffsetAlignment, 16);
+  texture_budget_bytes_ = uint64_t(REXCVAR_GET(carbon_gpu_texture_budget_mb)) << 20;
   chunk_size_ = VkDeviceSize(REXCVAR_GET(carbon_gpu_upload_chunk_mb)) << 20;
   chunk_size_ = std::min<VkDeviceSize>(chunk_size_, props.maxStorageBufferRange);
 
@@ -119,7 +177,7 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
 
   // Set 0: VS constants, PS constants, draw constants, vertex data.
   {
-    VkDescriptorSetLayoutBinding b[4] = {};
+    VkDescriptorSetLayoutBinding b[5] = {};
     for (uint32_t i = 0; i < 3; ++i) {
       b[i].binding = i;
       b[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -130,14 +188,16 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
     b[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[3].descriptorCount = 1;
     b[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    b[4] = b[3];
+    b[4].binding = 4;
     VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    ci.bindingCount = 4;
+    ci.bindingCount = 5;
     ci.pBindings = b;
     if (dfn.vkCreateDescriptorSetLayout(vk_device_, &ci, nullptr, &set0_layout_) != VK_SUCCESS) {
       return false;
     }
     VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * 256},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256}};
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512}};
     VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 256;
     pci.poolSizeCount = 2;
@@ -145,6 +205,9 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
     if (dfn.vkCreateDescriptorPool(vk_device_, &pci, nullptr, &set0_pool_) != VK_SUCCESS) {
       return false;
     }
+  }
+  if (!CreateVertexArena()) {
+    return false;
   }
 
   // Frames.
@@ -296,6 +359,19 @@ bool Renderer::BeginFrame() {
     dfn.vkResetFences(vk_device_, 1, &f.fence);
     f.submitted = false;
   }
+  if (arena_reset_pending_) {
+    // The arena is full: wait until no frame in flight reads it, then start over.
+    for (Frame& other : frames_) {
+      if (&other != &f && other.submitted) {
+        dfn.vkWaitForFences(vk_device_, 1, &other.fence, VK_TRUE, UINT64_MAX);
+      }
+    }
+    REXGPU_INFO("[carbon-gpu] vertex arena full ({} MiB, {} buffers): starting over",
+                arena_used_ >> 20, arena_entries_.size());
+    arena_entries_.clear();
+    arena_used_ = 0;
+    arena_reset_pending_ = false;
+  }
   for (auto& fn : f.deferred_destroy) fn();
   f.deferred_destroy.clear();
   for (uint32_t c : f.chunks) {
@@ -314,6 +390,9 @@ bool Renderer::BeginFrame() {
              frame_number_ == uint64_t(REXCVAR_GET(carbon_gpu_trace_frame));
   if (tracing_) {
     REXGPU_WARN("[carbon-gpu] ---- trace of frame {} ----", frame_number_);
+  }
+  if (frame_number_ % 30 == 0) {
+    EvictResources();
   }
   current_chunk_ = UINT32_MAX;
   chunk_offset_ = 0;
@@ -384,12 +463,14 @@ bool Renderer::AcquireChunk() {
     if (dfn.vkAllocateDescriptorSets(vk_device_, &dai, &chunk.set0) != VK_SUCCESS) {
       return false;
     }
-    VkDescriptorBufferInfo bufs[4] = {{chunk.buffer, 0, 4096},
+    VkDescriptorBufferInfo bufs[5] = {{chunk.buffer, 0, 4096},
                                       {chunk.buffer, 0, 4096},
                                       {chunk.buffer, 0, sizeof(DrawConstants)},
-                                      {chunk.buffer, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet w[4] = {};
-    for (uint32_t i = 0; i < 4; ++i) {
+                                      {chunk.buffer, 0, VK_WHOLE_SIZE},
+                                      {arena_buffer_ ? arena_buffer_ : chunk.buffer, 0,
+                                       VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[5] = {};
+    for (uint32_t i = 0; i < 5; ++i) {
       w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       w[i].dstSet = chunk.set0;
       w[i].dstBinding = i;
@@ -398,7 +479,7 @@ bool Renderer::AcquireChunk() {
           i < 3 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       w[i].pBufferInfo = &bufs[i];
     }
-    dfn.vkUpdateDescriptorSets(vk_device_, 4, w, 0, nullptr);
+    dfn.vkUpdateDescriptorSets(vk_device_, 5, w, 0, nullptr);
     upload_chunks_.push_back(chunk);
     index = uint32_t(upload_chunks_.size() - 1);
   }
@@ -902,8 +983,113 @@ void Renderer::ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint
   scissor = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
 }
 
-bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& c) {
+namespace {
+constexpr uint32_t kArenaPageBytes = 16 * 1024;
+constexpr uint8_t kArenaMaxInterval = 4;
+}  // namespace
+
+bool Renderer::CreateVertexArena() {
+  int32_t mb = REXCVAR_GET(carbon_gpu_vertex_arena_mb);
+  if (mb <= 0) {
+    return true;
+  }
+  const auto& props = vulkan_device_->properties();
+  arena_size_ = std::min<VkDeviceSize>(VkDeviceSize(mb) << 20, props.maxStorageBufferRange);
+  arena_size_ = std::min<VkDeviceSize>(arena_size_, 0x7FFFFFF0u);
+  VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = arena_size_;
+  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  VmaAllocationCreateInfo aci = {};
+  aci.usage = VMA_MEMORY_USAGE_AUTO;
+  aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+              VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VmaAllocationInfo info = {};
+  if (vmaCreateBuffer(allocator_, &bci, &aci, &arena_buffer_, &arena_allocation_, &info) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("[carbon-gpu] could not allocate the {} MiB vertex arena; uploading per frame", mb);
+    arena_buffer_ = VK_NULL_HANDLE;
+    arena_size_ = 0;
+    return true;
+  }
+  arena_mapped_ = static_cast<uint8_t*>(info.pMappedData);
+  return true;
+}
+
+// Makes [lo, hi) bytes of the guest vertex buffer available in the arena.
+// Returns false when the buffer has to go through the per-frame upload.
+bool Renderer::ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_t lo, uint32_t hi,
+                          uint32_t& dword_offset) {
+  if (!arena_buffer_ || !size || size > arena_size_ / 4) {
+    return false;
+  }
+  const uint8_t* src = physical_base_ + (address & 0x1FFFFFFF);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    auto it = arena_entries_.find(key);
+    if (it == arena_entries_.end()) {
+      auto ch = arena_changes_.find(key);
+      if (ch != arena_changes_.end() && ch->second >= 3) {
+        return false;  // rewritten too often to be worth caching
+      }
+      VkDeviceSize aligned = AlignUp64(size, 256);
+      if (arena_used_ + aligned > arena_size_) {
+        arena_reset_pending_ = true;
+        return false;
+      }
+      ArenaEntry e;
+      e.offset = uint32_t(arena_used_);
+      e.size = size;
+      uint32_t pages = (size + kArenaPageBytes - 1) / kArenaPageBytes;
+      e.page_hash.assign(pages, 0);
+      e.page_checked.assign(pages, 0);
+      e.page_interval.assign(pages, 1);
+      arena_used_ += aligned;
+      it = arena_entries_.emplace(key, std::move(e)).first;
+    }
+    ArenaEntry& e = it->second;
+    bool changed = false;
+    if (hi > lo) {
+      uint32_t first = lo / kArenaPageBytes, last = (hi - 1) / kArenaPageBytes;
+      for (uint32_t p = first; p <= last && p < e.page_hash.size(); ++p) {
+        if (e.page_checked[p] == frame_number_) continue;
+        if (e.page_hash[p] && frame_number_ < e.page_checked[p] + e.page_interval[p]) continue;
+        uint32_t page_start = p * kArenaPageBytes;
+        uint32_t n = std::min(kArenaPageBytes, size - page_start);
+        uint64_t h = HashBytes(src + page_start, n, 0) | 1;
+        if (!e.page_hash[p]) {
+          std::memcpy(arena_mapped_ + e.offset + page_start, src + page_start, n);
+          vmaFlushAllocation(allocator_, arena_allocation_, e.offset + page_start, n);
+          e.page_hash[p] = h;
+          stats_.arena_bytes += n;
+        } else if (h != e.page_hash[p]) {
+          changed = true;
+          break;
+        } else {
+          e.page_interval[p] = std::min<uint8_t>(e.page_interval[p] * 2, kArenaMaxInterval);
+        }
+        e.page_checked[p] = frame_number_;
+      }
+    }
+    if (!changed) {
+      dword_offset = e.offset / 4;
+      return true;
+    }
+    // The buffer was rewritten. Frames in flight may still read the old copy, so
+    // never overwrite it: drop the entry and copy into a fresh one (or give up on
+    // buffers that keep changing).
+    uint8_t& count = arena_changes_[key];
+    if (count < 255) ++count;
+    arena_entries_.erase(key);
+    if (count >= 3) {
+      return false;
+    }
+  }
+  return false;
+}
+
+bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& c,
+                               const VertexRange& range) {
   const TranslatedShader& t = vs->translated;
+  const bool use_ranges = REXCVAR_GET(carbon_gpu_vertex_ranges);
   for (uint32_t i = 0; i < 96; ++i) {
     c.vfetch[i * 2] = 0;
     c.vfetch[i * 2 + 1] = 0;
@@ -919,6 +1105,26 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
     }
     size = std::min<uint32_t>(size, uint32_t(chunk_size_ / 4));
     uint64_t key = (uint64_t(address) << 32) | size;
+
+    if (size) {
+      uint32_t lo = 0, hi = size;
+      uint32_t stride = t.vfetch_stride[i];
+      if (use_ranges && range.known && stride && !(t.vfetch_computed[i >> 5] & (1u << (i & 31)))) {
+        uint64_t lo64 = uint64_t(range.min_index) * stride * 4;
+        uint64_t hi64 = (uint64_t(range.max_index) * stride +
+                         std::max<uint32_t>(stride, t.vfetch_extent[i])) * 4;
+        lo = uint32_t(std::min<uint64_t>(lo64, size));
+        hi = uint32_t(std::min<uint64_t>(hi64, size));
+      }
+      uint32_t arena_dwords;
+      if (ArenaFetch(key, address, size, lo, hi, arena_dwords)) {
+        c.vfetch[i * 2] = arena_dwords;
+        c.vfetch[i * 2 + 1] = uint32_t(fetch.endian) | 0x80000000u;
+        ++stats_.arena_draws;
+        continue;
+      }
+    }
+    ++stats_.chunk_vertex_draws;
     if (vertex_upload_cache_chunk_ != current_chunk_) {
       vertex_upload_cache_.clear();
       vertex_upload_cache_chunk_ = current_chunk_;
@@ -1033,51 +1239,93 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
     Skip(kSkipNoPitch);
     return;
   }
-  // Height needed: the bottom of the scissor / viewport.
+  // Height needed: the bottom of the scissor, or of the viewport when that is
+  // higher up. Screen-space draws often leave the scissor at its 8192 default,
+  // so the EDRAM layout of the bound targets caps it further below.
   uint32_t needed_height;
   {
+    auto wtl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
     auto wbr = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
     auto sbr = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
-    needed_height = std::min<uint32_t>(wbr.br_y, uint32_t(std::max<int32_t>(sbr.br_y, 0)));
+    int32_t window_y = regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset;
+    int32_t bottom = int32_t(wbr.br_y) + (wtl.window_offset_disable ? 0 : window_y);
+    bottom = std::min(bottom, int32_t(sbr.br_y));
     auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
     if (vte.vport_y_scale_ena) {
       float sy = std::fabs(regs.GetFloat(XE_GPU_REG_PA_CL_VPORT_YSCALE));
       float oy = vte.vport_y_offset_ena ? regs.GetFloat(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
-      float bottom = oy + sy;
-      if (bottom > 0.0f && bottom < 8192.0f) {
-        needed_height = std::max(needed_height, std::min(uint32_t(std::ceil(bottom)),
-                                                         std::max<uint32_t>(wbr.br_y, 1)));
+      float vp_bottom = oy + sy;
+      if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+        vp_bottom += float(window_y);
+      }
+      if (vp_bottom > 0.0f && vp_bottom < 8192.0f) {
+        bottom = std::min(bottom, int32_t(std::ceil(vp_bottom)));
       }
     }
-    needed_height = std::clamp<uint32_t>(needed_height, 1, 8192);
+    needed_height = uint32_t(std::clamp<int32_t>(bottom, 1, 8192));
   }
+  // Rows a target can have before it runs into the next bound target (or the
+  // end of the 2048-tile EDRAM). Tiles are 80x16 samples of 32 bits.
+  auto msaa = surface.msaa_samples;
+  uint32_t edram_bases[5] = {};
+  uint32_t edram_base_count = 0;
+  auto edram_rows = [&](uint32_t base, bool wide) {
+    uint32_t limit = 2048;
+    for (uint32_t i = 0; i < edram_base_count; ++i) {
+      if (edram_bases[i] > base && edram_bases[i] < limit) limit = edram_bases[i];
+    }
+    if (base >= limit) return 16u;
+    uint32_t tile_w = 80 >> ((msaa == xenos::MsaaSamples::k4X ? 1 : 0) + (wide ? 1 : 0));
+    uint32_t tile_h = msaa != xenos::MsaaSamples::k1X ? 8 : 16;
+    uint32_t tiles_per_strip = (pitch + tile_w - 1) / tile_w;
+    return std::max((limit - base) / tiles_per_strip * tile_h, 16u);
+  };
   PassState pass;
   uint32_t color_write_masks[4] = {};
   uint32_t ps_colors = ps ? ps->translated.colors_written : 0;
   auto color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+  bool depth_used = depth_control.z_enable || depth_control.stencil_enable;
+  auto di = regs.Get<reg::RB_DEPTH_INFO>();
+  reg::RB_COLOR_INFO color_infos[4];
+  bool color_used[4] = {};
   if (edram_mode == xenos::EdramMode::kColorDepth) {
     for (uint32_t i = 0; i < 4; ++i) {
       uint32_t mask = (color_mask >> (i * 4)) & 0xF;
       if (!mask || !(ps_colors & (1u << i))) {
         continue;
       }
-      reg::RB_COLOR_INFO ci;
-      ci.value = regs[kColorInfoRegs[i]];
-      pass.color[i] = GetRenderTarget(false, ci.color_base, pitch, uint32_t(ci.color_format),
-                                      needed_height);
+      color_infos[i].value = regs[kColorInfoRegs[i]];
+      color_used[i] = true;
       color_write_masks[i] = mask;
+      edram_bases[edram_base_count++] = color_infos[i].color_base;
     }
   }
-  auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
-  bool depth_used = depth_control.z_enable || depth_control.stencil_enable;
   if (depth_used) {
-    auto di = regs.Get<reg::RB_DEPTH_INFO>();
+    edram_bases[edram_base_count++] = di.depth_base;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!color_used[i]) continue;
+    const auto& ci = color_infos[i];
+    pass.color[i] =
+        GetRenderTarget(false, ci.color_base, pitch, uint32_t(ci.color_format),
+                        std::min(needed_height,
+                                 edram_rows(ci.color_base, xenos::IsColorRenderTargetFormat64bpp(ci.color_format))));
+  }
+  if (depth_used) {
     pass.depth = GetRenderTarget(true, di.depth_base, pitch, uint32_t(di.depth_format),
-                                 needed_height);
+                                 std::min(needed_height, edram_rows(di.depth_base, false)));
   }
   bool any_target = pass.depth != nullptr;
   for (auto* c : pass.color) any_target |= c != nullptr;
   if (!any_target) {
+    if (tracing_) {
+      REXGPU_WARN(
+          "[carbon-gpu] trace: no target: edram mode {} color mask {:04X} ps {:016X} colors {:X} "
+          "depthcontrol {:08X} prim {:02X} count {}",
+          uint32_t(edram_mode), color_mask, ps ? ps->hash : 0, ps_colors,
+          regs[XE_GPU_REG_RB_DEPTHCONTROL], uint32_t(info.primitive_type), info.index_count);
+    }
     Skip(kSkipNoTarget);
     return;
   }
@@ -1110,8 +1358,10 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   if (ps) {
     PixelShaderVariant ps_variant;
     ps_variant.interpolator_count = interpolators;
-    ps_variant.flat_mask = regs.Get<reg::SQ_INTERPOLATOR_CNTL>().param_shade &
-                           ((1u << interpolators) - 1);
+    // SQ_INTERPOLATOR_CNTL.param_shade is not used for flat shading: the game
+    // leaves bits set for texture coordinates (boot movies sampled one texel).
+    // Everything is interpolated smoothly, as in the SDK's Xenos backends.
+    ps_variant.flat_mask = 0;
     ps_variant.param_gen = program_cntl.param_gen != 0;
     ps_variant.param_gen_index = ps_variant.param_gen
                                      ? regs.Get<reg::SQ_CONTEXT_MISC>().param_gen_pos
@@ -1242,7 +1492,7 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   // Estimate the upload size so the draw fits in one chunk.
   VkDeviceSize estimate = 4096 * 2 + sizeof(DrawConstants) + 3 * 256;
   for (uint32_t i = 0; i < 96; ++i) {
-    if (vs->translated.vfetch_used[i >> 5] & (1u << (i & 31))) {
+    if (!arena_buffer_ && (vs->translated.vfetch_used[i >> 5] & (1u << (i & 31)))) {
       estimate += (VkDeviceSize(regs.GetVertexFetch(i).size) << 2) + 32;
     }
   }
@@ -1254,14 +1504,6 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   BindTextures(regs, vs, 1, consts, vs_set);
   if (ps) {
     BindTextures(regs, ps, 2, consts, ps_set);
-  }
-
-  if (!SetupVertexData(regs, vs, consts)) {
-    // Chunk switched mid-way; retry once in the fresh chunk.
-    if (!SetupVertexData(regs, vs, consts)) {
-      Skip(kSkipVertices);
-      return;
-    }
   }
 
   // Indices.
@@ -1293,6 +1535,38 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
     std::memcpy(&v, guest_indices + i * 4, 4);
     return GpuSwap32(v, info.index_endian);
   };
+  // The vertices the indices reach, so only that part of each buffer is copied.
+  VertexRange vertex_range;
+  {
+    uint32_t index_offset_v = regs[XE_GPU_REG_VGT_INDX_OFFSET] & 0xFFFFFF;
+    if (!info.indexed) {
+      vertex_range.known = count > 0;
+      vertex_range.min_index = index_offset_v;
+      vertex_range.max_index = index_offset_v + (count ? count - 1 : 0);
+    } else if (count) {
+      uint32_t lo_i = UINT32_MAX, hi_i = 0;
+      bool restart = key.primitive_restart != 0;
+      uint32_t reset_mask = info.index_format == xenos::IndexFormat::kInt16 ? 0xFFFF : 0xFFFFFF;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint32_t v = read_index(i) & reset_mask;
+        if (restart && v == (reset_index & reset_mask)) continue;
+        lo_i = std::min(lo_i, v);
+        hi_i = std::max(hi_i, v);
+      }
+      if (lo_i <= hi_i) {
+        vertex_range.known = true;
+        vertex_range.min_index = lo_i + index_offset_v;
+        vertex_range.max_index = hi_i + index_offset_v;
+      }
+    }
+  }
+  if (!SetupVertexData(regs, vs, consts, vertex_range)) {
+    // Chunk switched mid-way; retry once in the fresh chunk.
+    if (!SetupVertexData(regs, vs, consts, vertex_range)) {
+      Skip(kSkipVertices);
+      return;
+    }
+  }
   if (expand == Expand::kRectList) {
     uint32_t rects = count / 3;
     host_count = rects * 6;
@@ -1475,10 +1749,11 @@ void main() {
   static const char* kPs = R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D xe_source;
 layout(std430, set = 0, binding = 1) readonly buffer XeGamma { uint table[256]; } xe_gamma;
-layout(push_constant) uniform XePresent { vec2 scale; uint use_gamma; uint pad; } xe_p;
+layout(push_constant) uniform XePresent { vec2 scale; uint use_gamma; uint swap_rb; } xe_p;
 layout(location = 0) out vec4 xe_out;
 void main() {
   vec4 c = texture(xe_source, gl_FragCoord.xy * xe_p.scale);
+  if (xe_p.swap_rb != 0u) c = c.bgra;
   if (xe_p.use_gamma != 0u) {
     uvec3 i = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
     uint r = xe_gamma.table[i.r], g = xe_gamma.table[i.g], b = xe_gamma.table[i.b];
@@ -1591,7 +1866,7 @@ void main() {
 
 void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
                              uint32_t source_height, VkImage dest, VkImageView dest_view,
-                             uint32_t width, uint32_t height, bool dest_written_before) {
+                             uint32_t width, uint32_t height, bool dest_written_before, bool swap_rb) {
   const auto& dfn = vulkan_device_->functions();
   VkImageLayout dest_layout = dest_written_before
                                   ? rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout
@@ -1632,8 +1907,8 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
     struct {
       float scale[2];
       uint32_t use_gamma;
-      uint32_t pad;
-    } pc = {{1.0f / float(source_width), 1.0f / float(source_height)}, 1, 0};
+      uint32_t swap_rb;
+    } pc = {{1.0f / float(source_width), 1.0f / float(source_height)}, 1, swap_rb ? 1u : 0u};
     // The guest output may be smaller than the source image (padded resolves).
     pc.scale[0] = float(width) / float(source_width) / float(width);
     pc.scale[1] = float(height) / float(source_height) / float(height);
@@ -1656,6 +1931,11 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   }
   EndRendering();
   std::memcpy(gamma_mapped_ + frame_index_ * 256, gamma.table, 1024);
+  if (frame_number_ % 600 == 0) {
+    REXGPU_WARN("[carbon-gpu] gamma table[64]={:08X} [128]={:08X} [255]={:08X} dirty {} pwl_dirty {}",
+                gamma.table[64], gamma.table[128], gamma.table[255], gamma.table_dirty,
+                gamma.pwl_dirty);
+  }
 
   rex::system::X_VIDEO_MODE video_mode;
   rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
@@ -1691,6 +1971,38 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   uint32_t out_w = width ? width : source_w;
   uint32_t out_h = height ? height : source_h;
 
+  // Frame dump (debugging): copy the front buffer to a readback buffer.
+  VkBuffer dump_buffer = VK_NULL_HANDLE;
+  VmaAllocation dump_allocation = VK_NULL_HANDLE;
+  void* dump_mapped = nullptr;
+  uint32_t dump_frame_slot = frame_index_;
+  uint64_t dump_number = frame_number_;
+  int32_t dump_interval = REXCVAR_GET(carbon_gpu_dump_frame_interval);
+  if (front && dump_interval > 0 && frame_number_ % uint64_t(dump_interval) == 0 &&
+      front->format.host_format == VK_FORMAT_R8G8B8A8_UNORM) {
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = VkDeviceSize(front->width) * front->height * 4;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo aci = {};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo ai;
+    if (vmaCreateBuffer(allocator_, &bci, &aci, &dump_buffer, &dump_allocation, &ai) ==
+        VK_SUCCESS) {
+      dump_mapped = ai.pMappedData;
+      VkCommandBuffer cb = frame().cb;
+      TransitionImage(cb, front->image, VK_IMAGE_ASPECT_COLOR_BIT, front->layout,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      VkBufferImageCopy region = {};
+      region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      region.imageExtent = {front->width, front->height, 1};
+      vulkan_device_->functions().vkCmdCopyImageToBuffer(
+          cb, front->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dump_buffer, 1, &region);
+      TransitionImage(cb, front->image, VK_IMAGE_ASPECT_COLOR_BIT, front->layout,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+  }
+
   bool submitted = false;
   if (presenter_) {
     presenter_->RefreshGuestOutput(
@@ -1703,7 +2015,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
           EndFrame(true, [&](VkCommandBuffer cb) {
             RecordPresent(cb, source_view, source_w, source_h, vk_context.image(),
                           vk_context.image_view(), out_w, out_h,
-                          vk_context.image_ever_written_previously());
+                          vk_context.image_ever_written_previously(), front && front->resolved_swap_rb);
           });
           submitted = true;
           return true;
@@ -1712,24 +2024,54 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   if (!submitted) {
     EndFrame(false, nullptr);
   }
+  if (dump_buffer) {
+    const auto& dfn = vulkan_device_->functions();
+    dfn.vkWaitForFences(vk_device_, 1, &frames_[dump_frame_slot].fence, VK_TRUE, UINT64_MAX);
+    vmaInvalidateAllocation(allocator_, dump_allocation, 0, VK_WHOLE_SIZE);
+    WriteBmp(fmt::format("carbon_frames/frame_{:06}.bmp", dump_number),
+             static_cast<const uint8_t*>(dump_mapped), front->width, front->height,
+             front->resolved_swap_rb);
+    vmaDestroyBuffer(allocator_, dump_buffer, dump_allocation);
+  }
 
   // Statistics.
   ++stats_frames_;
   double now = NowSeconds();
+  if (overlay_last_swap_ > 0.0) {
+    overlay_worst_ms_ = std::max(overlay_worst_ms_, (now - overlay_last_swap_) * 1000.0);
+  } else {
+    overlay_start_ = now;
+  }
+  overlay_last_swap_ = now;
+  ++overlay_frames_;
+  if (now - overlay_start_ >= 0.5) {
+#if defined(__ANDROID__)
+    double secs = now - overlay_start_;
+    rex_gpu_report_fps(float(overlay_frames_ / secs), float(secs * 1000.0 / overlay_frames_),
+                       float(overlay_worst_ms_));
+#endif
+    overlay_start_ = now;
+    overlay_frames_ = 0;
+    overlay_worst_ms_ = 0.0;
+  }
   if (now - stats_start_ >= 5.0) {
     if (REXCVAR_GET(carbon_gpu_stats)) {
       double secs = now - stats_start_;
       double f = double(std::max<uint64_t>(stats_frames_, 1));
       REXGPU_INFO(
           "[carbon-gpu] {:.1f} fps | per frame: draws {:.0f} (skipped {:.0f}), passes {:.1f}, "
-          "resolves {:.1f}, upload {:.2f} MiB | new: pipelines {}, shaders {}, textures {}",
+          "resolves {:.1f}, upload {:.2f} MiB, vertex copy {:.2f} MiB (arena {:.0f}/chunk {:.0f} fetches) | "
+          "new: pipelines {}, shaders {}, textures {} | mem: tex {} MiB, rt {} MiB, arena {} MiB, evicted {}",
           f / secs, stats_.draws / f, stats_.draws_skipped / f, stats_.passes / f,
           stats_.resolves / f, double(stats_.upload_bytes) / f / (1024.0 * 1024.0),
-          stats_.pipelines_created, stats_.shaders_compiled, stats_.textures_uploaded);
+          double(stats_.arena_bytes) / f / (1024.0 * 1024.0), stats_.arena_draws / f,
+          stats_.chunk_vertex_draws / f, stats_.pipelines_created, stats_.shaders_compiled,
+          stats_.textures_uploaded, texture_bytes_ >> 20, render_target_bytes_ >> 20,
+          arena_used_ >> 20, stats_.evicted);
     }
     if (REXCVAR_GET(carbon_gpu_stats) && stats_.draws_skipped) {
       static const char* kNames[kSkipReasonCount] = {
-          "no-vs", "edram-mode", "ps-failed", "memexport", "primitive", "no-pitch", "no-target",
+          "no-vs", "edram-mode", "ps-failed", "memexport", "primitive", "no-pitch", "no-output",
           "modules", "cull-all", "pipeline", "scissor", "vertices", "no-indices"};
       std::string reasons;
       double frames = double(std::max<uint64_t>(stats_frames_, 1));

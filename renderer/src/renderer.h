@@ -77,6 +77,7 @@ struct RenderTarget {
   uint32_t width = 0, height = 0;
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint64_t last_used_frame = 0;
+  uint64_t memory_bytes = 0;
 };
 
 // A host image that holds guest texture data (decoded from memory, or the
@@ -97,8 +98,10 @@ struct Texture {
   uint64_t last_hash_frame = 0;
   uint32_t hash_interval = 1;
   bool resolved = false;            // Contents come from GPU resolves.
+  bool resolved_swap_rb = false;    // Last resolve swapped red/blue (copy_dest_swap).
   uint64_t resolved_memory_hash = 0;  // Guest memory hash when last resolved.
   uint64_t last_used_frame = 0;
+  uint64_t memory_bytes = 0;
 };
 
 class Renderer {
@@ -204,8 +207,10 @@ class Renderer {
   // ---- Textures (textures.cpp) ----
   Texture* GetTexture(const GuestTexture& guest, bool allow_upload);
   Texture* FindResolvedTexture(uint32_t base_address, uint32_t width, uint32_t height);
+  // `y_offset` receives the first row of the resolve in the returned texture
+  // (non-zero for tiles resolved into a texture that starts above them).
   Texture* GetOrCreateResolveTexture(uint32_t base_address, uint32_t width, uint32_t height,
-                                     xenos::TextureFormat format);
+                                     xenos::TextureFormat format, uint32_t& y_offset);
   bool CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage);
   void UploadTexture(Texture& t);
   VkImageView GetTextureView(Texture& t, uint32_t swizzle, bool use_signed,
@@ -215,6 +220,7 @@ class Renderer {
                     DrawConstants& constants, VkDescriptorSet& set_out);
   void CreateNullTextures();
   std::unordered_multimap<uint32_t, std::unique_ptr<Texture>> textures_;  // by base address
+  std::vector<Texture*> resolved_textures_;
   std::unordered_map<uint64_t, VkSampler> samplers_;
   struct NullTexture {
     VkImage image = VK_NULL_HANDLE;
@@ -235,7 +241,37 @@ class Renderer {
   void SavePipelineCache();
 
   // ---- Draw helpers ----
-  bool SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& constants);
+  struct VertexRange {
+    bool known = false;
+    uint32_t min_index = 0, max_index = 0;  // vertex indices, after the index offset
+  };
+  bool SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstants& constants,
+                       const VertexRange& range);
+  // Persistent copy of guest vertex buffers, refreshed by page hash.
+  bool CreateVertexArena();
+  bool ArenaFetch(uint64_t key, uint32_t address, uint32_t size, uint32_t lo, uint32_t hi,
+                  uint32_t& dword_offset);
+  struct ArenaEntry {
+    uint32_t offset = 0;  // bytes in the arena
+    uint32_t size = 0;
+    std::vector<uint64_t> page_hash;  // 0 = page not copied yet
+    std::vector<uint64_t> page_checked;
+    std::vector<uint8_t> page_interval;
+  };
+  VkBuffer arena_buffer_ = VK_NULL_HANDLE;
+  VmaAllocation arena_allocation_ = VK_NULL_HANDLE;
+  uint8_t* arena_mapped_ = nullptr;
+  VkDeviceSize arena_size_ = 0;
+  VkDeviceSize arena_used_ = 0;
+  bool arena_reset_pending_ = false;
+  std::unordered_map<uint64_t, ArenaEntry> arena_entries_;
+  std::unordered_map<uint64_t, uint8_t> arena_changes_;  // >= 3: treated as dynamic
+
+  // Frees textures and render targets that have not been used for a while.
+  void EvictResources();
+  uint64_t texture_bytes_ = 0;
+  uint64_t texture_budget_bytes_ = 0;
+  uint64_t render_target_bytes_ = 0;
   void ComputeViewport(const RegisterFile& regs, uint32_t rt_width, uint32_t rt_height,
                        DrawConstants& constants, VkViewport& viewport, VkRect2D& scissor);
 
@@ -243,7 +279,7 @@ class Renderer {
   bool CreatePresentPipeline();
   void RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t source_width,
                      uint32_t source_height, VkImage dest, VkImageView dest_view, uint32_t width,
-                     uint32_t height, bool dest_written_before);
+                     uint32_t height, bool dest_written_before, bool swap_rb);
   VkPipeline present_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout present_pipeline_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
@@ -305,7 +341,7 @@ class Renderer {
     kSkipMemexport,
     kSkipPrimitive,
     kSkipNoPitch,
-    kSkipNoTarget,
+    kSkipNoTarget,  // Nothing written: color writes masked off, no depth/stencil.
     kSkipModules,
     kSkipCullAll,
     kSkipPipeline,
@@ -317,7 +353,8 @@ class Renderer {
   struct Stats {
     uint32_t draws = 0, draws_skipped = 0, resolves = 0, passes = 0, pipelines_created = 0;
     uint32_t textures_uploaded = 0, shaders_compiled = 0;
-    uint64_t upload_bytes = 0;
+    uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
+    uint32_t evicted = 0;
     uint32_t skip[kSkipReasonCount] = {};
   } stats_;
   void Skip(SkipReason reason) {
@@ -331,6 +368,9 @@ class Renderer {
   bool tracing_ = false;
   uint64_t stats_frames_ = 0;
   double stats_start_ = 0.0;
+  // Frame pacing for the Android fps overlay (rex_gpu_report_fps), every 0.5 s.
+  double overlay_start_ = 0.0, overlay_last_swap_ = 0.0, overlay_worst_ms_ = 0.0;
+  uint32_t overlay_frames_ = 0;
 };
 
 }  // namespace carbon::gpu

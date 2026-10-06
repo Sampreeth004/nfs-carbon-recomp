@@ -27,6 +27,8 @@ public final class GameConfig {
     public static final String PREFS = "nfscarbon_prefs";
     public static final String TOML_NAME = "nfscarbon.toml";
 
+    // GPU plugin: "carbon" (native Vulkan renderer) or "xenos" (Xenos emulation).
+    public static final String KEY_RENDERER = "gpu_plugin";
     public static final String KEY_WIDTH = "video_mode_width";
     public static final String KEY_HEIGHT = "video_mode_height";
     public static final String KEY_VSYNC = "vsync";
@@ -57,6 +59,7 @@ public final class GameConfig {
     public static final int DEFAULT_HEIGHT = 720;
     public static final int DEFAULT_MSAA_SAMPLES = 0;
     public static final String DEFAULT_FXAA = "none";
+    public static final String DEFAULT_RENDERER = "carbon";
     public static final String DEFAULT_UPSCALER = "bilinear";
     public static final String DEFAULT_LAYOUT = "xbox";
     public static final float DEFAULT_OPACITY = 0.55f;
@@ -85,6 +88,7 @@ public final class GameConfig {
         int guestHeight = p.getInt(KEY_HEIGHT, DEFAULT_HEIGHT);
 
         Map<String, String> values = new LinkedHashMap<>();
+        values.put(KEY_RENDERER, quote(p.getString(KEY_RENDERER, DEFAULT_RENDERER)));
         values.put(KEY_WIDTH, String.valueOf(guestWidth));
         values.put(KEY_HEIGHT, String.valueOf(guestHeight));
         values.put(KEY_VSYNC, bool(p.getBoolean(KEY_VSYNC, true)));

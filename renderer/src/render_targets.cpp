@@ -80,7 +80,7 @@ VkFormat Renderer::ColorTargetFormat(xenos::ColorRenderTargetFormat f) const {
     case F::k_8_8_8_8:
       return VK_FORMAT_R8G8B8A8_UNORM;
     case F::k_8_8_8_8_GAMMA:
-      return VK_FORMAT_R8G8B8A8_SRGB;
+      return VK_FORMAT_R8G8B8A8_UNORM;
     case F::k_2_10_10_10:
     case F::k_2_10_10_10_AS_10_10_10_10:
       return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
@@ -129,10 +129,7 @@ bool Renderer::CreateRenderTargetImage(RenderTarget& rt, uint32_t width, uint32_
               VK_IMAGE_USAGE_TRANSFER_DST_BIT |
               (rt.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                            : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  VkFormat raw_format = rt.format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : rt.format;
-  if (raw_format != rt.format) {
-    ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-  }
+  VkFormat raw_format = rt.format;
   VmaAllocationCreateInfo aci = {};
   aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
   if (vmaCreateImage(allocator_, &ici, &aci, &rt.image, &rt.allocation, nullptr) != VK_SUCCESS) {
@@ -155,15 +152,35 @@ bool Renderer::CreateRenderTargetImage(RenderTarget& rt, uint32_t width, uint32_
   rt.width = width;
   rt.height = height;
   rt.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  {
+    uint32_t bpp = 4;
+    switch (rt.format) {
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+      case VK_FORMAT_R32G32_SFLOAT:
+      case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        bpp = 8;
+        break;
+      default:
+        break;
+    }
+    rt.memory_bytes = uint64_t(width) * height * bpp;
+    render_target_bytes_ += rt.memory_bytes;
+  }
   return true;
 }
 
 RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_t pitch,
                                         uint32_t format, uint32_t min_height) {
+  if (!depth) {
+    format = uint32_t(xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(format)));
+  }
   uint64_t key = (uint64_t(depth) << 40) | (uint64_t(format & 0xF) << 32) |
                  (uint64_t(pitch & 0x3FFF) << 12) | (edram_base & 0xFFF);
   auto it = render_targets_.find(key);
   RenderTarget* rt = it != render_targets_.end() ? it->second.get() : nullptr;
+  if (rt) {
+    rt->last_used_frame = frame_number_;
+  }
   if (rt && rt->height >= min_height) {
     return rt;
   }
@@ -181,6 +198,7 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
       return nullptr;
     }
     rt = created.get();
+    rt->last_used_frame = frame_number_;
     render_targets_.emplace(key, std::move(created));
     REXGPU_DEBUG("[carbon-gpu] new {} render target base {} pitch {} format {} -> {}x{}",
                  depth ? "depth" : "color", edram_base, pitch, format, width, height);
@@ -195,6 +213,7 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
     *rt = old;
     return rt;
   }
+  render_target_bytes_ -= std::min(render_target_bytes_, old.memory_bytes);
   VkCommandBuffer cb = frame().cb;
   VkImageAspectFlags aspect =
       depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -468,14 +487,20 @@ void Renderer::Resolve(const RegisterFile& regs) {
   uint32_t dest_w = dest_pitch.copy_dest_pitch ? dest_pitch.copy_dest_pitch : uint32_t(x1);
   uint32_t dest_h = dest_pitch.copy_dest_height ? dest_pitch.copy_dest_height : uint32_t(y1);
   Texture* dest = nullptr;
+  uint32_t dest_y_offset = 0;
   if (src && dest_base) {
-    dest = GetOrCreateResolveTexture(dest_base, dest_w, dest_h, dest_format);
+    dest = GetOrCreateResolveTexture(dest_base, dest_w, dest_h, dest_format, dest_y_offset);
+  }
+  if (tracing_ && dest && dest_y_offset) {
+    REXGPU_WARN("[carbon-gpu] trace: resolve into texture {:08X} at row {}",
+                dest->guest.base_address, dest_y_offset);
   }
   if (src && dest) {
+    int32_t dy = int32_t(dest_y_offset);
     int32_t dx0 = std::min<int32_t>(x0, int32_t(dest->width));
-    int32_t dy0 = std::min<int32_t>(y0, int32_t(dest->height));
+    int32_t dy0 = std::min<int32_t>(y0 + dy, int32_t(dest->height));
     int32_t dx1 = std::min<int32_t>(x1, int32_t(dest->width));
-    int32_t dy1 = std::min<int32_t>(y1, int32_t(dest->height));
+    int32_t dy1 = std::min<int32_t>(y1 + dy, int32_t(dest->height));
     if (dx1 > dx0 && dy1 > dy0) {
       VkImageAspectFlags src_aspect =
           is_depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
@@ -516,7 +541,7 @@ void Renderer::Resolve(const RegisterFile& regs) {
         int32_t offset[2];
         float scale;
         uint32_t swap_rb;
-      } pc = {{0, 0},
+      } pc = {{0, -dy},
               is_depth ? 1.0f : std::ldexp(1.0f, int(dest_info.copy_dest_exp_bias)),
               (!is_depth && dest_info.copy_dest_swap) ? 1u : 0u};
       dfn.vkCmdPushConstants(cb, resolve_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16,
@@ -530,6 +555,7 @@ void Renderer::Resolve(const RegisterFile& regs) {
       TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, 1);
       dest->resolved = true;
+      dest->resolved_swap_rb = !is_depth && dest_info.copy_dest_swap;
       dest->last_used_frame = frame_number_;
     }
   }

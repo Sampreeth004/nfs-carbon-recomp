@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">NFS Carbon</string>
-    <string name="launcher_subtitle">ReXGlue recompilation (Xbox 360)</string>
-    <string name="launcher_hint">Tap PLAY to start the game. Settings are written to the runtime config before launch.</string>
+    <string name="launcher_subtitle">Xbox 360 recompilation - native Vulkan renderer</string>
+    <string name="edit_controls">CONTROLS</string>
     <string name="play">PLAY</string>
     <string name="settings">SETTINGS</string>
     <string name="game_data">Game data</string>

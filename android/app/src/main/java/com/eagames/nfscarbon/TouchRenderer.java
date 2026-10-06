@@ -3,7 +3,9 @@ package com.eagames.nfscarbon;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.Typeface;
 
 import java.util.List;
 
@@ -17,8 +19,31 @@ public final class TouchRenderer {
     public static final int COLOR_TEXT = 0xFFFFFFFF;
     public static final int COLOR_SELECTED = 0xFFFF5252;
     public static final int COLOR_ACCENT = 0xCCFFC107;
+    private static final int COLOR_BACKDROP = 0x66000000;
+
+    private static final int TINT_A = 0xFF4CAF50;
+    private static final int TINT_B = 0xFFE53935;
+    private static final int TINT_X = 0xFF1E88E5;
+    private static final int TINT_Y = 0xFFFDD835;
+
+    private static final Path scratchPath = new Path();
 
     private TouchRenderer() {
+    }
+
+    /** Shoulder, trigger and menu buttons are drawn as horizontal pills. */
+    public static boolean isPill(TouchLayout.Control control) {
+        switch (control.id) {
+            case "lb":
+            case "rb":
+            case "lt":
+            case "rt":
+            case "start":
+            case "back":
+                return true;
+            default:
+                return false;
+        }
     }
 
     public static RectF boundsOf(TouchLayout.Control control, float width, float height,
@@ -30,6 +55,13 @@ public final class TouchRenderer {
                     control.x * width + halfWidth, control.y * height + halfHeight);
         }
         float radius = control.size * Math.min(width, height) * scale;
+        if (isPill(control)) {
+            float halfWidth = radius * ("start".equals(control.id) || "back".equals(control.id)
+                    ? 1.5f : 1.8f);
+            float halfHeight = radius * 0.8f;
+            return new RectF(control.x * width - halfWidth, control.y * height - halfHeight,
+                    control.x * width + halfWidth, control.y * height + halfHeight);
+        }
         return new RectF(control.x * width - radius, control.y * height - radius,
                 control.x * width + radius, control.y * height + radius);
     }
@@ -54,7 +86,6 @@ public final class TouchRenderer {
     public static void drawControl(Canvas canvas, Paint paint, TouchLayout.Control control,
                                    RectF bounds, float alpha, boolean pressed, boolean selected,
                                    float knobX, float knobY, Bitmap icon) {
-        int fill = pressed ? COLOR_FILL_PRESSED : COLOR_FILL;
         int strokeColor = selected ? COLOR_SELECTED : COLOR_STROKE;
         float strokeWidth = dp(canvas, selected ? 3f : 2f);
         float radius = bounds.width() * 0.5f;
@@ -65,9 +96,9 @@ public final class TouchRenderer {
                 || "dpad".equals(kind) || "wheel".equals(kind));
 
         if (icon != null) {
-            if (pressed && !isStick && !"wheel".equals(kind)) {
+            if (!isStick && !"wheel".equals(kind)) {
                 paint.setStyle(Paint.Style.FILL);
-                paint.setColor(withAlpha(COLOR_FILL_PRESSED, alpha));
+                paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_BACKDROP, alpha));
                 canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius, paint);
             }
             if (selected) {
@@ -90,39 +121,32 @@ public final class TouchRenderer {
             return;
         }
 
-        if ("button".equals(kind) || "trigger".equals(kind) || "pedal".equals(kind)) {
+        if (isPill(control)) {
+            drawPill(canvas, paint, control, bounds, alpha, pressed, strokeColor, strokeWidth);
+        } else if ("button".equals(kind) || "trigger".equals(kind)) {
+            drawRoundButton(canvas, paint, control, bounds, alpha, pressed, strokeColor,
+                    strokeWidth);
+        } else if ("pedal".equals(kind)) {
+            float corner = radius * 0.5f;
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(withAlpha(fill, alpha));
-            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius, paint);
+            paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+            canvas.drawRoundRect(bounds, corner, corner, paint);
+            paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_FILL, alpha));
+            canvas.drawRoundRect(bounds, corner, corner, paint);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(strokeWidth);
             paint.setColor(withAlpha(strokeColor, alpha));
-            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+            canvas.drawRoundRect(bounds, corner, corner, paint);
             drawLabel(canvas, paint, control.label, bounds.centerX(), bounds.centerY(),
-                    radius * 0.7f, alpha);
+                    radius * 0.6f, alpha);
         } else if ("dpad".equals(kind)) {
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(withAlpha(fill, alpha));
-            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
-
-            float arm = radius * 0.30f;
-            float edge = radius * 0.32f;
-            paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_PLATE, alpha));
-            canvas.drawRoundRect(new RectF(bounds.centerX() - arm, bounds.top + edge,
-                    bounds.centerX() + arm, bounds.bottom - edge),
-                    arm * 0.5f, arm * 0.5f, paint);
-            canvas.drawRoundRect(new RectF(bounds.left + edge, bounds.centerY() - arm,
-                    bounds.right - edge, bounds.centerY() + arm),
-                    arm * 0.5f, arm * 0.5f, paint);
-
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(strokeWidth);
-            paint.setColor(withAlpha(strokeColor, alpha));
-            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+            drawDpad(canvas, paint, bounds, alpha, pressed, strokeColor, strokeWidth);
         } else if ("wheel".equals(kind)) {
             float corner = bounds.height() * 0.5f;
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(withAlpha(fill, alpha));
+            paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+            canvas.drawRoundRect(bounds, corner, corner, paint);
+            paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_FILL, alpha));
             canvas.drawRoundRect(bounds, corner, corner, paint);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(strokeWidth);
@@ -134,15 +158,127 @@ public final class TouchRenderer {
             canvas.drawLine(markerX, bounds.top + bounds.height() * 0.2f,
                     markerX, bounds.bottom - bounds.height() * 0.2f, paint);
         } else {
+            // Analog stick: dark base, outer and inner ring, floating knob.
             paint.setStyle(Paint.Style.FILL);
-            paint.setColor(withAlpha(fill, alpha));
+            paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+            paint.setColor(withAlpha(COLOR_FILL, alpha));
             canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(strokeWidth);
             paint.setColor(withAlpha(strokeColor, alpha));
             canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+            paint.setStrokeWidth(dp(canvas, 1f));
+            paint.setColor(withAlpha(COLOR_PLATE, alpha));
+            canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius * 0.55f, paint);
             drawKnob(canvas, paint, bounds, alpha, pressed, strokeColor, knobX, knobY);
         }
+    }
+
+    private static int faceTint(TouchLayout.Control control) {
+        switch (control.id) {
+            case "a":
+                return TINT_A;
+            case "b":
+                return TINT_B;
+            case "x":
+                return TINT_X;
+            case "y":
+                return TINT_Y;
+            default:
+                return 0;
+        }
+    }
+
+    private static int withChannelAlpha(int color, int a) {
+        return (color & 0x00FFFFFF) | ((a & 0xFF) << 24);
+    }
+
+    private static void drawRoundButton(Canvas canvas, Paint paint, TouchLayout.Control control,
+                                        RectF bounds, float alpha, boolean pressed,
+                                        int strokeColor, float strokeWidth) {
+        float radius = bounds.width() * 0.5f * (pressed ? 1.06f : 1f);
+        float inset = dp(canvas, 1.5f);
+        int tint = faceTint(control);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius, paint);
+        int fill;
+        int stroke = strokeColor;
+        if (tint != 0) {
+            fill = withChannelAlpha(tint, pressed ? 0xDD : 0x55);
+            if (strokeColor != COLOR_SELECTED) {
+                stroke = withChannelAlpha(tint, 0xE6);
+            }
+        } else {
+            fill = pressed ? COLOR_FILL_PRESSED : COLOR_FILL;
+        }
+        paint.setColor(withAlpha(fill, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(strokeWidth);
+        paint.setColor(withAlpha(stroke, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+        drawLabel(canvas, paint, control.label, bounds.centerX(), bounds.centerY(),
+                radius * 0.8f, alpha);
+    }
+
+    private static void drawPill(Canvas canvas, Paint paint, TouchLayout.Control control,
+                                 RectF bounds, float alpha, boolean pressed, int strokeColor,
+                                 float strokeWidth) {
+        float corner = bounds.height() * 0.5f;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+        canvas.drawRoundRect(bounds, corner, corner, paint);
+        paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_FILL, alpha));
+        canvas.drawRoundRect(bounds, corner, corner, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(strokeWidth);
+        paint.setColor(withAlpha(strokeColor, alpha));
+        canvas.drawRoundRect(bounds, corner, corner, paint);
+        drawLabel(canvas, paint, control.label, bounds.centerX(), bounds.centerY(),
+                bounds.height() * 0.46f, alpha);
+    }
+
+    private static void drawDpad(Canvas canvas, Paint paint, RectF bounds, float alpha,
+                                 boolean pressed, int strokeColor, float strokeWidth) {
+        float radius = bounds.width() * 0.5f;
+        float inset = dp(canvas, 1.5f);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+        paint.setColor(withAlpha(COLOR_FILL, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
+
+        float arm = radius * 0.30f;
+        float edge = radius * 0.22f;
+        paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_PLATE, alpha));
+        canvas.drawRoundRect(new RectF(bounds.centerX() - arm, bounds.top + edge,
+                bounds.centerX() + arm, bounds.bottom - edge), arm * 0.5f, arm * 0.5f, paint);
+        canvas.drawRoundRect(new RectF(bounds.left + edge, bounds.centerY() - arm,
+                bounds.right - edge, bounds.centerY() + arm), arm * 0.5f, arm * 0.5f, paint);
+
+        // Direction arrows.
+        paint.setColor(withAlpha(COLOR_TEXT, alpha));
+        float tip = radius * 0.78f;
+        float base = radius * 0.52f;
+        float half = radius * 0.13f;
+        float cx = bounds.centerX(), cy = bounds.centerY();
+        for (int d = 0; d < 4; d++) {
+            float dx = d == 2 ? -1 : (d == 3 ? 1 : 0);
+            float dy = d == 0 ? -1 : (d == 1 ? 1 : 0);
+            scratchPath.reset();
+            scratchPath.moveTo(cx + dx * tip, cy + dy * tip);
+            scratchPath.lineTo(cx + dx * base - dy * half, cy + dy * base + dx * half);
+            scratchPath.lineTo(cx + dx * base + dy * half, cy + dy * base - dx * half);
+            scratchPath.close();
+            canvas.drawPath(scratchPath, paint);
+        }
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(strokeWidth);
+        paint.setColor(withAlpha(strokeColor, alpha));
+        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius - inset, paint);
     }
 
     private static void drawKnob(Canvas canvas, Paint paint, RectF bounds, float alpha,
@@ -150,10 +286,12 @@ public final class TouchRenderer {
         float radius = bounds.width() * 0.5f;
         float inset = dp(canvas, 1.5f);
         float knobRadius = radius * 0.40f;
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_KNOB, alpha));
         float kx = bounds.centerX() + knobX * (radius - knobRadius - inset);
         float ky = bounds.centerY() + knobY * (radius - knobRadius - inset);
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(withAlpha(COLOR_BACKDROP, alpha));
+        canvas.drawCircle(kx, ky + dp(canvas, 2f), knobRadius, paint);
+        paint.setColor(withAlpha(pressed ? COLOR_FILL_PRESSED : COLOR_KNOB, alpha));
         canvas.drawCircle(kx, ky, knobRadius, paint);
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(dp(canvas, 1.5f));
@@ -188,9 +326,11 @@ public final class TouchRenderer {
         paint.setColor(withAlpha(COLOR_TEXT, alpha));
         paint.setTextAlign(Paint.Align.CENTER);
         paint.setTextSize(textSize);
+        paint.setTypeface(Typeface.DEFAULT_BOLD);
         Paint.FontMetrics metrics = paint.getFontMetrics();
         float baseline = centerY - (metrics.ascent + metrics.descent) * 0.5f;
         canvas.drawText(label, centerX, baseline, paint);
+        paint.setTypeface(Typeface.DEFAULT);
     }
 
     public static int withAlpha(int color, float alpha) {

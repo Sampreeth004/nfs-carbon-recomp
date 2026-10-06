@@ -72,6 +72,14 @@ public class SettingsActivity extends Activity {
         buildDriver();
         buildTouch();
         buildAbout();
+        if (getIntent().getBooleanExtra(LauncherActivity.EXTRA_OPEN_CONTROLS, false)) {
+            container.post(new Runnable() {
+                @Override
+                public void run() {
+                    openLayoutEditor();
+                }
+            });
+        }
     }
 
     @Override
@@ -85,6 +93,27 @@ public class SettingsActivity extends Activity {
 
     private void buildGraphics() {
         section(R.string.graphics);
+
+        final String[] rendererLabels = {
+                "Native Vulkan (default)", "Xenos emulation (fallback)"
+        };
+        final String[] rendererValues = {"carbon", "xenos"};
+        String renderer = prefs.getString(GameConfig.KEY_RENDERER, GameConfig.DEFAULT_RENDERER);
+        spinnerRow("Renderer", rendererLabels, "xenos".equals(renderer) ? 1 : 0,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putString(GameConfig.KEY_RENDERER,
+                                rendererValues[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+        label("MSAA, single pass, occlusion and post-effect options apply to Xenos emulation "
+                + "only.");
 
         int width = prefs.getInt(GameConfig.KEY_WIDTH, GameConfig.DEFAULT_WIDTH);
         int height = prefs.getInt(GameConfig.KEY_HEIGHT, GameConfig.DEFAULT_HEIGHT);
@@ -792,7 +821,8 @@ public class SettingsActivity extends Activity {
         section(R.string.about);
         label("NFS Carbon Android launcher for the ReXGlue recompilation.\n"
                 + "Game data: Need for Speed: Carbon (Xbox 360) ISO or extracted folder.\n"
-                + "Rendering: Vulkan (xenos GPU plugin).");
+                + "Rendering: native Vulkan renderer (carbon GPU plugin), or Xenos emulation "
+                + "(xenos GPU plugin) as a fallback.");
     }
 
     // ------------------------------------------------------------------ Helpers

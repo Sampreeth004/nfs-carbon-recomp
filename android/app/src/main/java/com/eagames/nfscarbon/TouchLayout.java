@@ -24,7 +24,7 @@ public class TouchLayout {
     public static final String DEFAULT_ASSET = "touch_layouts_default.json";
     public static final String LAYOUT_XBOX = "xbox";
     public static final String LAYOUT_DRIVING = "driving";
-    public static final int VERSION = 3;
+    public static final int VERSION = 4;
 
     public static final class Control {
         public String id = "";
@@ -279,64 +279,68 @@ public class TouchLayout {
     private void buildFallback() {
         layouts.clear();
         List<Control> xbox = new ArrayList<>();
-        xbox.add(control("ls", "stick", 0.14f, 0.66f, 0.17f));
-        xbox.add(control("rs", "stick", 0.86f, 0.68f, 0.16f));
-        xbox.add(button("a", "A", 0.83f, 0.46f, 0.060f, 4096));
-        xbox.add(button("b", "B", 0.93f, 0.40f, 0.060f, 8192));
-        xbox.add(button("x", "X", 0.77f, 0.35f, 0.060f, 16384));
-        xbox.add(button("y", "Y", 0.88f, 0.28f, 0.060f, 32768));
-        xbox.add(button("lb", "LB", 0.70f, 0.16f, 0.050f, 256));
-        xbox.add(button("rb", "RB", 0.83f, 0.14f, 0.050f, 512));
-        Control lt = control("lt", "trigger", 0.60f, 0.09f, 0.060f);
-        lt.label = "LT";
-        lt.axis = "lt";
-        xbox.add(lt);
-        Control rt = control("rt", "trigger", 0.94f, 0.09f, 0.060f);
-        rt.label = "RT";
-        rt.axis = "rt";
-        xbox.add(rt);
-        xbox.add(control("dpad", "dpad", 0.06f, 0.30f, 0.10f));
-        xbox.add(button("start", "\u2630", 0.53f, 0.88f, 0.045f, 16));
-        xbox.add(button("back", "\u23CE", 0.45f, 0.88f, 0.045f, 32));
+        xbox.add(control("ls", "stick", 0.13f, 0.68f, 0.17f));
+        xbox.add(control("dpad", "dpad", 0.31f, 0.80f, 0.095f));
+        xbox.add(trigger("lt", "LT", 0.08f, 0.10f, 0.065f, "lt"));
+        xbox.add(button("lb", "LB", 0.08f, 0.25f, 0.065f, 256));
+        xbox.add(trigger("rt", "RT", 0.92f, 0.10f, 0.065f, "rt"));
+        xbox.add(button("rb", "RB", 0.92f, 0.25f, 0.065f, 512));
+        xbox.add(button("y", "Y", 0.88f, 0.46f, 0.064f, 32768));
+        xbox.add(button("x", "X", 0.81f, 0.62f, 0.064f, 16384));
+        xbox.add(button("b", "B", 0.95f, 0.62f, 0.064f, 8192));
+        xbox.add(button("a", "A", 0.88f, 0.78f, 0.064f, 4096));
+        xbox.add(control("rs", "stick", 0.68f, 0.78f, 0.11f));
+        xbox.add(button("back", "\u23CE", 0.44f, 0.91f, 0.045f, 32));
+        xbox.add(button("start", "\u2630", 0.56f, 0.91f, 0.045f, 16));
         layouts.put(LAYOUT_XBOX, xbox);
 
         List<Control> driving = new ArrayList<>();
         Control wheel = new Control();
         wheel.id = "wheel";
         wheel.kind = "wheel";
-        wheel.x = 0.24f;
-        wheel.y = 0.62f;
-        wheel.w = 0.18f;
-        wheel.h = 0.38f;
+        wheel.x = 0.20f;
+        wheel.y = 0.72f;
+        wheel.w = 0.30f;
+        wheel.h = 0.34f;
         wheel.icon = "steering";
         driving.add(wheel);
-        Control gas = control("gas", "pedal", 0.84f, 0.60f, 0.12f);
-        gas.label = "GAS";
-        gas.axis = "rt";
-        gas.icon = "accelerate";
-        driving.add(gas);
-        Control brake = control("brake", "pedal", 0.69f, 0.60f, 0.12f);
+        Control brake = control("brake", "pedal", 0.74f, 0.74f, 0.115f);
         brake.label = "BRK";
         brake.axis = "lt";
         brake.icon = "brake";
         driving.add(brake);
-        Control handbrake = button("hb", "HB", 0.50f, 0.35f, 0.075f, 4096);
+        Control gas = control("gas", "pedal", 0.89f, 0.70f, 0.135f);
+        gas.label = "GAS";
+        gas.axis = "rt";
+        gas.icon = "accelerate";
+        driving.add(gas);
+        Control handbrake = button("hb", "HB", 0.50f, 0.78f, 0.075f, 4096);
         handbrake.icon = "handbrake";
         driving.add(handbrake);
-        driving.add(button("b", "B", 0.93f, 0.28f, 0.060f, 8192));
-        driving.add(button("x", "X", 0.80f, 0.28f, 0.060f, 16384));
-        driving.add(button("y", "Y", 0.865f, 0.175f, 0.060f, 32768));
-        Control look = control("look", "stick", 0.09f, 0.28f, 0.14f);
+        driving.add(button("x", "X", 0.41f, 0.60f, 0.062f, 16384));
+        driving.add(button("b", "B", 0.59f, 0.60f, 0.062f, 8192));
+        driving.add(button("y", "Y", 0.50f, 0.44f, 0.062f, 32768));
+        driving.add(button("lb", "LB", 0.07f, 0.12f, 0.060f, 256));
+        driving.add(button("rb", "RB", 0.93f, 0.12f, 0.060f, 512));
+        Control look = control("look", "stick", 0.12f, 0.38f, 0.10f);
         look.icon = "view360";
         driving.add(look);
-        Control start = button("start", "\u2630", 0.53f, 0.88f, 0.05f, 16);
-        start.icon = "pause";
-        driving.add(start);
-        Control back = button("back", "\u23CE", 0.45f, 0.88f, 0.05f, 32);
+        Control back = button("back", "\u23CE", 0.44f, 0.08f, 0.042f, 32);
         back.icon = "rear_view";
         driving.add(back);
+        Control start = button("start", "\u2630", 0.56f, 0.08f, 0.042f, 16);
+        start.icon = "pause";
+        driving.add(start);
         layouts.put(LAYOUT_DRIVING, driving);
-        active = LAYOUT_XBOX;
+        active = LAYOUT_DRIVING;
+    }
+
+    private static Control trigger(String id, String label, float x, float y, float size,
+                                   String axis) {
+        Control control = control(id, "trigger", x, y, size);
+        control.label = label;
+        control.axis = axis;
+        return control;
     }
 
     private static Control control(String id, String kind, float x, float y, float size) {

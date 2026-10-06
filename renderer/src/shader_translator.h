@@ -38,6 +38,12 @@ struct TranslatedShader {
 
   // Resources.
   uint32_t vfetch_used[3] = {};  // 96 bits
+  // Per fetch constant: vertex stride and the dwords read past the vertex start
+  // (both in dwords); `vfetch_computed` bits mark constants fetched with an index
+  // other than the plain vertex index (r0.x), whose range is not known.
+  uint32_t vfetch_stride[96] = {};
+  uint32_t vfetch_extent[96] = {};
+  uint32_t vfetch_computed[3] = {};
   std::vector<TextureBinding> textures;
   uint32_t texture_descriptor_count = 0;
   // Highest float constant index read (+1), 256 if relatively addressed.

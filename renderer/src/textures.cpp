@@ -150,6 +150,13 @@ bool Renderer::CreateTextureImage(Texture& t, VkImageUsageFlags extra_usage) {
                  t.height, t.depth, uint32_t(g.format));
     return false;
   }
+  {
+    uint64_t texels = uint64_t(t.width) * t.height * t.depth * t.layers;
+    uint64_t blocks = texels / (uint64_t(t.format.host_block_width) * t.format.host_block_height);
+    t.memory_bytes = blocks * t.format.host_bytes_per_block;
+    if (t.levels > 1) t.memory_bytes += t.memory_bytes / 3;
+    texture_bytes_ += t.memory_bytes;
+  }
   t.layout = VK_IMAGE_LAYOUT_UNDEFINED;
   t.view_type = is_3d ? VK_IMAGE_VIEW_TYPE_3D
                       : (is_cube ? VK_IMAGE_VIEW_TYPE_CUBE
@@ -235,8 +242,34 @@ Texture* Renderer::FindResolvedTexture(uint32_t base_address, uint32_t width, ui
 }
 
 Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t width,
-                                             uint32_t height, xenos::TextureFormat format) {
+                                             uint32_t height, xenos::TextureFormat format,
+                                             uint32_t& y_offset) {
   base_address &= 0x1FFFFFFF;
+  y_offset = 0;
+  // Predicated tiling resolves each screen tile to the address of its first
+  // row inside one texture. Tiled textures store 32-row strips contiguously,
+  // so a strip boundary is at row * aligned pitch * bytes per texel.
+  uint32_t bytes_per_texel = GetTextureFormatInfo(format, true).bytes_per_block;
+  uint32_t strip_bytes = AlignUp(width, 32u) * 32 * bytes_per_texel;
+  for (Texture* t : resolved_textures_) {
+    uint32_t parent = t->guest.base_address;
+    if (parent >= base_address || t->guest.format != format || t->width != width) {
+      continue;
+    }
+    uint32_t delta = base_address - parent;
+    if (delta % strip_bytes) {
+      continue;
+    }
+    // Inside the parent (a texture placed right after it starts at or past
+    // its 32-aligned height). Depth tiles keep the full height in the copy
+    // registers, color tiles the remaining height; the copy is clamped anyway.
+    uint32_t rows = delta / strip_bytes * 32;
+    if (rows < t->height) {
+      y_offset = rows;
+      t->last_used_frame = frame_number_;
+      return t;
+    }
+  }
   auto range = textures_.equal_range(base_address);
   for (auto it = range.first; it != range.second; ++it) {
     Texture* t = it->second.get();
@@ -266,6 +299,7 @@ Texture* Renderer::GetOrCreateResolveTexture(uint32_t base_address, uint32_t wid
   t->last_used_frame = frame_number_;
   Texture* raw = t.get();
   textures_.emplace(base_address, std::move(t));
+  resolved_textures_.push_back(raw);
   return raw;
 }
 
@@ -525,6 +559,77 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
   vulkan_device_->functions().vkUpdateDescriptorSets(vk_device_, uint32_t(writes.size()),
                                                      writes.data(), 0, nullptr);
   set_out = set;
+}
+
+void Renderer::EvictResources() {
+  const auto& dfn = vulkan_device_->functions();
+  constexpr uint64_t kMinAge = 8;         // frames; longer than the frames in flight
+  constexpr uint64_t kStaleAge = 1800;    // frames; always freed
+
+  // Render targets that nothing has drawn to or resolved from for a while.
+  for (auto it = render_targets_.begin(); it != render_targets_.end();) {
+    RenderTarget& rt = *it->second;
+    if (frame_number_ > rt.last_used_frame + 900) {
+      VkImage image = rt.image;
+      VmaAllocation allocation = rt.allocation;
+      VkImageView view = rt.view, sample_view = rt.sample_view;
+      render_target_bytes_ -= std::min(render_target_bytes_, rt.memory_bytes);
+      DeferDestroy([this, image, allocation, view, sample_view]() {
+        const auto& d = vulkan_device_->functions();
+        d.vkDestroyImageView(vk_device_, view, nullptr);
+        d.vkDestroyImageView(vk_device_, sample_view, nullptr);
+        vmaDestroyImage(allocator_, image, allocation);
+      });
+      it = render_targets_.erase(it);
+      ++stats_.evicted;
+    } else {
+      ++it;
+    }
+  }
+
+  // Textures: anything stale, then least recently used while over budget.
+  const uint64_t budget = texture_budget_bytes_;
+  const uint64_t target = budget / 100 * 85;
+  const bool trimming = texture_bytes_ > budget;
+  std::vector<Texture*> candidates;
+  for (auto& entry : textures_) {
+    Texture* t = entry.second.get();
+    if (frame_number_ > t->last_used_frame + kMinAge) {
+      candidates.push_back(t);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Texture* a, const Texture* b) { return a->last_used_frame < b->last_used_frame; });
+  for (Texture* t : candidates) {
+    bool stale = frame_number_ > t->last_used_frame + kStaleAge;
+    if (!stale && !(trimming && texture_bytes_ > target)) {
+      break;
+    }
+    VkImage image = t->image;
+    VmaAllocation allocation = t->allocation;
+    std::vector<VkImageView> views;
+    for (auto& v : t->views) views.push_back(v.second);
+    texture_bytes_ -= std::min(texture_bytes_, t->memory_bytes);
+    DeferDestroy([this, image, allocation, views]() {
+      const auto& d = vulkan_device_->functions();
+      for (VkImageView v : views) d.vkDestroyImageView(vk_device_, v, nullptr);
+      vmaDestroyImage(allocator_, image, allocation);
+    });
+    if (t->resolved) {
+      resolved_textures_.erase(std::remove(resolved_textures_.begin(), resolved_textures_.end(), t),
+                               resolved_textures_.end());
+    }
+    uint32_t key = (t->guest.base_address ? t->guest.base_address : t->guest.mip_address) & 0x1FFFFFFF;
+    auto range = textures_.equal_range(key);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second.get() == t) {
+        textures_.erase(it);
+        break;
+      }
+    }
+    ++stats_.evicted;
+  }
+  (void)dfn;
 }
 
 }  // namespace carbon::gpu
