@@ -31,6 +31,18 @@ public final class GameBridge {
 
     public static native float nativeGetGuestWorstMs();
 
+    public static native void nativeSetGamePaused(boolean paused);
+
+    public static void setGamePaused(boolean paused) {
+        if (!nativeAvailable) {
+            return;
+        }
+        try {
+            nativeSetGamePaused(paused);
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
     public static void setTouchPad(int buttons, float lstickX, float lstickY,
                                    float rstickX, float rstickY,
                                    float leftTrigger, float rightTrigger) {

@@ -1,0 +1,1202 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..0ee5ba6 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -150,6 +150,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+     return deferred_command_buffer_;
+   }
+ 
++  // PARCHE LOCAL - subidas adelantadas: donde empieza en el flujo diferido el
++  // pase de render abierto, o SIZE_MAX si no hay uno de los que admiten
++  // adelantar subidas.
++  size_t NfsmwInicioPase() const { return in_render_pass_ ? nfsmw_inicio_pase_ : SIZE_MAX; }
++  void NfsmwPaseDesplazado(size_t elementos) { nfsmw_inicio_pase_ += elementos; }
++
+   bool submission_open() const { return submission_open_; }
+   uint64_t GetCurrentSubmission() const {
+     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+@@ -425,6 +431,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool CanEndSubmissionImmediately() const;
+ 
+   void ClearTransientDescriptorPools();
++  bool IssueCopyImpl();
+   bool IssueCopy_ReadbackResolvePath();
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+@@ -794,6 +801,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   VkRenderPass current_render_pass_;
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
++  size_t nfsmw_inicio_pase_ = SIZE_MAX;  // PARCHE LOCAL - subidas adelantadas
+ 
+   // Currently bound graphics pipeline, either from the pipeline cache (with
+   // potentially deferred creation - current_external_graphics_pipeline_ is
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..0ed7d55 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -104,6 +104,7 @@ class VulkanDevice {
+     bool fillModeNonSolid = false;
+     bool samplerAnisotropy = false;
+     bool occlusionQueryPrecise = false;
++    bool pipelineStatisticsQuery = false;
+     bool vertexPipelineStoresAndAtomics = false;
+     bool fragmentStoresAndAtomics = false;
+     bool shaderClipDistance = false;
+@@ -111,6 +112,16 @@ class VulkanDevice {
+     bool sparseBinding = false;
+     bool sparseResidencyBuffer = false;
+ 
++    // Features enabled for the native renderer (cvar vulkan_native_shader_features).
++    // Adapted from nfsmw-android (GPL-3.0, https://github.com/codepdbh/nfsmw-android) sdk/.
++    bool shaderInt64 = false;
++    bool shaderSampledImageArrayDynamicIndexing = false;
++    bool bufferDeviceAddress = false;
++    bool runtimeDescriptorArray = false;
++    bool descriptorBindingPartiallyBound = false;
++    bool descriptorBindingSampledImageUpdateAfterBind = false;
++    bool descriptorBindingUpdateUnusedWhilePending = false;
++
+     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
+ 
+     bool samplerMirrorClampToEdge = false;
+@@ -168,6 +179,13 @@ class VulkanDevice {
+     // VK_EXT_robustness2
+ 
+     bool nullDescriptor = false;
++
++    // VK_EXT_extended_dynamic_state3 (#456). Only what the native renderer uses (dynamic blend
++    // enable, blend equation and color write mask).
++
++    bool extendedDynamicState3ColorBlendEnable = false;
++    bool extendedDynamicState3ColorBlendEquation = false;
++    bool extendedDynamicState3ColorWriteMask = false;
+   };
+ 
+   // Properties of the core API and enabled extensions, and enabled features.
+@@ -199,6 +217,8 @@ class VulkanDevice {
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
++    // Native renderer (dynamic blending and color write masks).
++    bool ext_EXT_extended_dynamic_state3 = false;  // #456
+   };
+ 
+   const Extensions& extensions() const { return extensions_; }
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..f892da1 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,13 +9,18 @@
+  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
+  */
+ 
++#include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
+ #include <functional>
++#include <mutex>
+ #include <string>
++#include <vector>
+ 
+ #include <fcntl.h>
+ 
+@@ -53,8 +58,7 @@
+ 
+ #include <linux/ashmem.h>
+ 
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <rex/main_android.h>
+ #endif
+ 
+ namespace rex {
+@@ -189,6 +193,59 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+   return false;
+ }
+ 
++// Cached /proc/self/maps snapshot for the exception fast path.
++//
++// The write-watch fault handler queries the current protection of guest arena
++// pages on every fault (mmio_handler.cpp). Parsing /proc/self/maps regenerates
++// the seq_file text of every VMA in the process (hundreds of VMAs under a
++// Vulkan driver), which costs 50 us to >1 ms per fault - all while holding the
++// global critical region, and dozens of thousands of times per session on a
++// phone.
++//
++// Every protection change to guest arena pages flows through the mutating
++// functions below (AllocFixed / DeallocFixed / Protect), which invalidate the
++// snapshot, so the cache is always fresh for the addresses the fault path
++// queries. External (non-arena) mappings mutated by other components are never
++// the subject of fault-path queries, and a fault itself proves the page is not
++// writable, so a stale entry cannot skip a legitimate write-watch fixup.
++struct LinuxMapsCache {
++  std::mutex mutex;
++  std::vector<LinuxMapEntry> entries;
++  bool valid = false;
++};
++
++static LinuxMapsCache g_linux_maps_cache;
++
++static bool FindEntryForAddressCached(void* address, LinuxMapEntry& out_entry) {
++  const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
++  std::lock_guard<std::mutex> lock(g_linux_maps_cache.mutex);
++  if (!g_linux_maps_cache.valid) {
++    g_linux_maps_cache.entries.clear();
++    std::ifstream maps("/proc/self/maps");
++    if (!maps.is_open()) {
++      return false;
++    }
++    std::string line;
++    while (std::getline(maps, line)) {
++      LinuxMapEntry e;
++      if (ParseProcMapsLine(line, e)) {
++        g_linux_maps_cache.entries.push_back(e);
++      }
++    }
++    std::sort(g_linux_maps_cache.entries.begin(), g_linux_maps_cache.entries.end(),
++              [](const LinuxMapEntry& a, const LinuxMapEntry& b) { return a.start < b.start; });
++    g_linux_maps_cache.valid = true;
++  }
++  const auto it = std::lower_bound(
++      g_linux_maps_cache.entries.begin(), g_linux_maps_cache.entries.end(), addr,
++      [](const LinuxMapEntry& e, uintptr_t value) { return e.end <= value; });
++  if (it == g_linux_maps_cache.entries.end() || addr < it->start) {
++    return false;
++  }
++  out_entry = *it;
++  return true;
++}
++
+ // Check if [base, base+length) is fully covered by existing mappings (no gaps)
+ static bool IsRangeFullyMapped(void* base_address, size_t length) {
+   if (!base_address || length == 0)
+@@ -237,6 +294,16 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
+ }  // namespace
+ #endif  // REX_PLATFORM_LINUX
+ 
++// Drop the cached /proc/self/maps snapshot (no-op on non-Linux platforms).
++// Called by every function in this file that mutates page mappings, so the
++// fault-path QueryProtect always observes the current protection state.
++static void InvalidateLinuxMapsCache() {
++#if REX_PLATFORM_LINUX
++  std::lock_guard<std::mutex> lock(g_linux_maps_cache.mutex);
++  g_linux_maps_cache.valid = false;
++#endif  // REX_PLATFORM_LINUX
++}
++
+ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
+                  PageAccess access) {
+   // Emulates Windows VirtualAlloc behavior:
+@@ -245,6 +312,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   // - New allocation: mmap with MAP_FIXED_NOREPLACE (never silently replace)
+   const uint32_t prot_requested = ToPosixProtectFlags(access);
+ 
++  // This function mutates page mappings; drop the cached /proc/self/maps
++  // snapshot used by the fault-path QueryProtect before (and after) mutating.
++  InvalidateLinuxMapsCache();
++
+   // Determine initial protection based on allocation type
+   int prot_initial = 0;
+   switch (allocation_type) {
+@@ -296,6 +367,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ 
+   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
+   if (result != MAP_FAILED) {
++    InvalidateLinuxMapsCache();
+     return result;
+   }
+ #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
+@@ -307,6 +379,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+     // Verify the entire range is mapped before using mprotect
+     if (IsRangeFullyMapped(base_address, length)) {
+       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
++        InvalidateLinuxMapsCache();
+         return base_address;
+       }
+     }
+@@ -326,10 +399,15 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+ #if defined(MADV_DONTNEED)
+       (void)madvise(base_address, length, MADV_DONTNEED);
+ #endif
++      InvalidateLinuxMapsCache();
+       return true;
+     }
+     case DeallocationType::kRelease: {
+-      return munmap(base_address, length) == 0;
++      const bool released = munmap(base_address, length) == 0;
++      if (released) {
++        InvalidateLinuxMapsCache();
++      }
++      return released;
+     }
+     default:
+       // how we get here? :(
+@@ -338,7 +416,83 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+   }
+ }
+ 
++// Census counters (gpu_census): read by the GPU plugin through dlsym-free extern "C" symbols.
++extern "C" {
++__attribute__((visibility("default"))) std::atomic<bool> nfscarbon_census_on{false};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_protect_calls{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_protect_ns{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_protect_old_calls{0};
++__attribute__((visibility("default"))) std::atomic<int32_t> nfscarbon_cp_tid{0};
++}
++
++// Per call site (return address, CP thread or other) mprotect counters for the census.
++namespace {
++struct ProtectSite {
++  std::atomic<uintptr_t> key{0};  // return address | 1 if from the CP thread
++  std::atomic<uint64_t> calls{0};
++  std::atomic<uint64_t> ns{0};
++  std::atomic<uint64_t> bytes{0};
++};
++ProtectSite g_protect_sites[32];
++void RecordProtectSite(void* return_address, bool cp, uint64_t ns, size_t length) {
++  const uintptr_t key = (uintptr_t(return_address) & ~uintptr_t(1)) | (cp ? 1 : 0);
++  for (size_t i = 0; i < 32; ++i) {
++    ProtectSite& s = g_protect_sites[(key / 4 + i) & 31];
++    uintptr_t expected = 0;
++    if (s.key.load(std::memory_order_relaxed) == key ||
++        s.key.compare_exchange_strong(expected, key, std::memory_order_relaxed) || expected == key) {
++      s.calls.fetch_add(1, std::memory_order_relaxed);
++      s.ns.fetch_add(ns, std::memory_order_relaxed);
++      s.bytes.fetch_add(length, std::memory_order_relaxed);
++      return;
++    }
++  }
++}
++}  // namespace
++
++// Writes up to 'max' lines "key calls ns bytes" for the census and clears the table.
++extern "C" __attribute__((visibility("default"))) size_t nfscarbon_protect_sites_dump(
++    uintptr_t* out_key, uint64_t* out_calls, uint64_t* out_ns, uint64_t* out_bytes, size_t max) {
++  size_t n = 0;
++  for (ProtectSite& s : g_protect_sites) {
++    const uintptr_t key = s.key.load(std::memory_order_relaxed);
++    if (!key) {
++      continue;
++    }
++    if (n < max) {
++      out_key[n] = key;
++      out_calls[n] = s.calls.exchange(0, std::memory_order_relaxed);
++      out_ns[n] = s.ns.exchange(0, std::memory_order_relaxed);
++      out_bytes[n] = s.bytes.exchange(0, std::memory_order_relaxed);
++      ++n;
++    }
++  }
++  return n;
++}
++
+ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
++  const bool census = nfscarbon_census_on.load(std::memory_order_relaxed);
++  const auto census_t0 = census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
++  struct CensusEnd {
++    bool on;
++    std::chrono::steady_clock::time_point t0;
++    void* ra;
++    size_t length;
++    ~CensusEnd() {
++      if (on) {
++        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now() - t0)
++                                         .count());
++        nfscarbon_protect_calls.fetch_add(1, std::memory_order_relaxed);
++        nfscarbon_protect_ns.fetch_add(ns, std::memory_order_relaxed);
++        RecordProtectSite(ra, int32_t(gettid()) == nfscarbon_cp_tid.load(std::memory_order_relaxed),
++                          ns, length);
++      }
++    }
++  } census_end{census, census_t0, __builtin_return_address(0), length};
++  if (census && out_old_access) {
++    nfscarbon_protect_old_calls.fetch_add(1, std::memory_order_relaxed);
++  }
+   if (out_old_access) {
+     *out_old_access = PageAccess::kNoAccess;
+   }
+@@ -370,6 +524,9 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
+                  strerror(errno), errno);
+   }
++  if (ret == 0) {
++    InvalidateLinuxMapsCache();
++  }
+   return ret == 0;
+ }
+ 
+@@ -417,7 +574,7 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   length = 0;
+ 
+   LinuxMapEntry e;
+-  if (!FindEntryForAddress(base_address, e)) {
++  if (!FindEntryForAddressCached(base_address, e)) {
+     return false;
+   }
+ 
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..7f6e156 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,11 +10,15 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <bit>
++#include <chrono>
+ #include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/math.h>
+@@ -337,10 +341,26 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+   watch_range_first_free_ = range;
+ }
+ 
++REXCVAR_DEFINE_INT32(gpu_invalidate_widen_pages, 64, "GPU",
++                     "Max aligned window (pages, power of two, 1-64) the shared memory invalidates "
++                     "around a guest write when no GPU-written data is nearby. 64 = original "
++                     "(256 KB with 4 KB pages); smaller re-uploads and re-protects less per fault "
++                     "but takes more faults");
++
++extern "C" {
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_calls{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_uploads{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_upload_pages{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_upload_ns{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_invalidations{0};
++__attribute__((visibility("default"))) std::atomic<uint64_t> nfscarbon_sm_invalidated_pages{0};
++}
++
+ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+   if (ranges == nullptr || !count) {
+     return true;
+   }
++  nfscarbon_sm_calls.fetch_add(1, std::memory_order_relaxed);
+ 
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+@@ -461,11 +481,30 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                     uint32_t(upload_ranges_.size()));
+ 
+-  if (upload_ranges_.empty()) {
+-    return true;
++  const auto census_upload_t0 = std::chrono::steady_clock::now();
++  const bool nfsmw_subido = upload_ranges_.empty() || UploadRanges(upload_ranges_);
++  if (!upload_ranges_.empty()) {
++    uint64_t census_pages = 0;
++    for (const auto& r : upload_ranges_) {
++      census_pages += r.second;
++    }
++    nfscarbon_sm_uploads.fetch_add(1, std::memory_order_relaxed);
++    nfscarbon_sm_upload_pages.fetch_add(census_pages, std::memory_order_relaxed);
++    nfscarbon_sm_upload_ns.fetch_add(
++        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                     std::chrono::steady_clock::now() - census_upload_t0)
++                     .count()),
++        std::memory_order_relaxed);
++  }
++  // PARCHE LOCAL - subidas adelantadas: lo pedido lo lee lo que viene detras
++  // (el dibujado), asi que desde ahora cuenta como leido en este pase. Se
++  // apunta despues de subir: su propia subida si se puede adelantar.
++  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++    const uint32_t pagina = range.first >> page_size_log2_;
++    nfsmw_lecturas_pase_.emplace_back(
++        pagina, ((range.first + range.second - 1) >> page_size_log2_) - pagina + 1);
+   }
+-
+-  return UploadRanges(upload_ranges_);
++  return nfsmw_subido;
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+@@ -486,6 +525,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+   }
+   length = std::min(length, kBufferSize - physical_address_start);
+   uint32_t physical_address_last = physical_address_start + (length - 1);
++  nfscarbon_sm_invalidations.fetch_add(1, std::memory_order_relaxed);
++  nfscarbon_sm_invalidated_pages.fetch_add((length + (1u << page_size_log2_) - 1) >> page_size_log2_,
++                                           std::memory_order_relaxed);
+ 
+   uint32_t page_first = physical_address_start >> page_size_log2_;
+   uint32_t page_last = physical_address_last >> page_size_log2_;
+@@ -494,6 +536,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+ 
+   auto global_lock = global_critical_region_.Acquire();
+ 
++  const uint32_t census_requested_first = page_first;
++  const uint32_t census_requested_last = page_last;
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+     // invalidated - if no GPU-written data nearby that was not intended to be
+@@ -516,6 +560,17 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     }
+   }
+ 
++  if (!exact_range) {
++    // gpu_invalidate_widen_pages: limit the widening to an aligned window of that many pages
++    // around the requested range.
++    uint32_t widen = uint32_t(std::max<int32_t>(1, std::min<int32_t>(64, REXCVAR_GET(gpu_invalidate_widen_pages))));
++    if (widen < 64) {
++      widen = std::bit_floor(widen);  // round down to a power of two
++      page_first = std::max(page_first, census_requested_first & ~(widen - 1));
++      page_last = std::min(page_last, census_requested_last | (widen - 1));
++    }
++  }
++
+   for (uint32_t i = block_first; i <= block_last; ++i) {
+     uint64_t invalidate_bits = UINT64_MAX;
+     if (i == block_first) {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..9b8094c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -9,8 +9,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <dlfcn.h>
++#include <unistd.h>
++
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+@@ -46,6 +51,122 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++// PARCHE LOCAL - fences: el vigia (ver tools/parche_fences.py).
++#include <condition_variable>
++
++#if REX_PLATFORM_ANDROID
++// Defined in librexruntime.so (src/system/runtime.cpp): 0.5 s fps window for
++// the on-screen counter in the Android app.
++extern "C" void rex_gpu_report_fps(float fps, float frame_ms, float worst_ms);
++#endif
++#include <deque>
++#include <mutex>
++#include <thread>
++#if defined(__linux__)
++#include <pthread.h>
++#endif
++REXCVAR_DEFINE_BOOL(vulkan_vigia_fences, true, "GPU/Vulkan",
++                    "Un hilo aparte espera a los fences de los envios, para que el procesador "
++                    "de comandos no tenga que consultarlos")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++namespace {
++// Espera en orden a los fences de los envios y publica cuantos han acabado.
++// El procesador de comandos solo reciclaba un fence despues de que este hilo
++// lo diera por senalado, asi que nunca se reinicia uno que se este esperando.
++class NfsmwVigiaFences {
++ public:
++  ~NfsmwVigiaFences() { Parar(); }
++  bool activo() const { return hilo_.joinable(); }
++  void Iniciar(VkDevice device, PFN_vkWaitForFences esperar) {
++    if (hilo_.joinable()) {
++      return;
++    }
++    device_ = device;
++    esperar_ = esperar;
++    {
++      std::lock_guard<std::mutex> l(m_);
++      parar_ = false;
++      perdido_ = false;
++      cola_.clear();
++      completados_ = 0;
++    }
++    completados_publicados_.store(0, std::memory_order_release);
++    perdido_publicado_.store(false, std::memory_order_release);
++    hilo_ = std::thread([this] { Bucle(); });
++  }
++  void Parar() {
++    if (!hilo_.joinable()) {
++      return;
++    }
++    {
++      std::lock_guard<std::mutex> l(m_);
++      parar_ = true;
++    }
++    cv_nuevo_.notify_all();
++    hilo_.join();
++    cola_.clear();
++  }
++  void Encolar(VkFence fence) {
++    {
++      std::lock_guard<std::mutex> l(m_);
++      cola_.push_back(fence);
++    }
++    cv_nuevo_.notify_one();
++  }
++  // Fences senalados desde Iniciar, en el orden en que se encolaron.
++  uint64_t Completados() const { return completados_publicados_.load(std::memory_order_acquire); }
++  bool Perdido() const { return perdido_publicado_.load(std::memory_order_acquire); }
++  void EsperarHasta(uint64_t n) {
++    std::unique_lock<std::mutex> l(m_);
++    cv_hecho_.wait(l, [&] { return completados_ >= n || perdido_ || !hilo_.joinable(); });
++  }
++
++ private:
++  void Bucle() {
++#if defined(__linux__)
++    pthread_setname_np(pthread_self(), "GPU fences");
++#endif
++    std::unique_lock<std::mutex> l(m_);
++    for (;;) {
++      cv_nuevo_.wait(l, [&] { return parar_ || !cola_.empty(); });
++      if (cola_.empty()) {
++        break;
++      }
++      VkFence fence = cola_.front();
++      l.unlock();
++      const VkResult resultado = esperar_(device_, 1, &fence, VK_TRUE, UINT64_MAX);
++      l.lock();
++      if (resultado != VK_SUCCESS) {
++        perdido_ = true;
++        perdido_publicado_.store(true, std::memory_order_release);
++        cv_hecho_.notify_all();
++        break;
++      }
++      cola_.pop_front();
++      ++completados_;
++      completados_publicados_.store(completados_, std::memory_order_release);
++      cv_hecho_.notify_all();
++    }
++  }
++
++  VkDevice device_ = VK_NULL_HANDLE;
++  PFN_vkWaitForFences esperar_ = nullptr;
++  std::mutex m_;
++  std::condition_variable cv_nuevo_;
++  std::condition_variable cv_hecho_;
++  std::deque<VkFence> cola_;
++  uint64_t completados_ = 0;
++  bool parar_ = false;
++  bool perdido_ = false;
++  std::atomic<uint64_t> completados_publicados_{0};
++  std::atomic<bool> perdido_publicado_{false};
++  std::thread hilo_;
++};
++NfsmwVigiaFences nfsmw_vigia;
++// submission_completed_ cuando arranco el vigia: sus cuentas van desde ahi.
++uint64_t nfsmw_vigia_base = 0;
++}  // namespace
++
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+@@ -69,10 +190,75 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_census, false, "GPU/Vulkan",
++                    "Log a per-frame draw/pass/resolve census with CP-thread timings ([census])")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_census_interval, 120, "GPU/Vulkan",
++                     "Frames between [census] log lines (averaged over the interval)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+ 
++// Frame census probe (gpu_census). Touched only from the command processor
++// thread, so no locking.
++struct GpuCensus {
++  enum Step {
++    kStepPrimitive,
++    kStepTranslate,
++    kStepTextures,
++    kStepRenderTargets,
++    kStepPipeline,
++    kStepState,  // dynamic state + system constants + bindings
++    kStepVertexRanges,  // shared-memory requests for the vertex fetch constants
++    kStepRecord,  // memexport, barriers, draw record
++    kStepCount
++  };
++  uint64_t frames = 0;
++  uint64_t draws = 0;
++  uint64_t copies = 0;
++  uint64_t passes = 0;
++  uint64_t placeholder_draws = 0;
++  uint64_t draw_ns = 0;
++  uint64_t copy_ns = 0;
++  uint64_t step_ns[kStepCount] = {};
++  uint64_t unique_pairs_sum = 0;
++  uint64_t new_pairs_total = 0;
++  uint64_t frame_start_ns = 0;
++  uint64_t frame_cp_ns_sum = 0;
++  const void* last_framebuffer = nullptr;
++  std::vector<uint64_t> frame_pairs;  // VS^PS keys seen this frame
++  std::vector<uint64_t> seen_pairs;   // sorted, ever seen
++  static uint64_t NowNs() {
++    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                        std::chrono::steady_clock::now().time_since_epoch())
++                        .count());
++  }
++};
++GpuCensus g_census;
++
++extern "C" {
++extern std::atomic<bool> nfscarbon_census_on;
++extern std::atomic<uint64_t> nfscarbon_protect_calls;
++extern std::atomic<uint64_t> nfscarbon_protect_ns;
++extern std::atomic<uint64_t> nfscarbon_protect_old_calls;
++extern std::atomic<uint64_t> nfscarbon_sm_calls;
++extern std::atomic<uint64_t> nfscarbon_sm_uploads;
++extern std::atomic<uint64_t> nfscarbon_sm_upload_pages;
++extern std::atomic<uint64_t> nfscarbon_sm_upload_ns;
++extern std::atomic<int32_t> nfscarbon_cp_tid;
++extern std::atomic<uint64_t> nfscarbon_sm_invalidations;
++extern std::atomic<uint64_t> nfscarbon_sm_invalidated_pages;
++size_t nfscarbon_protect_sites_dump(uintptr_t*, uint64_t*, uint64_t*, uint64_t*, size_t);
++}
++struct CensusExtern {
++  uint64_t protect_calls = 0, protect_ns = 0, protect_old = 0;
++  uint64_t sm_calls = 0, sm_uploads = 0, sm_pages = 0, sm_ns = 0, inval = 0, inval_pages = 0;
++};
++CensusExtern g_census_extern_base;
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -2097,6 +2283,7 @@ void VulkanCommandProcessor::ShutdownContext() {
+     dfn.vkDestroySemaphore(device, semaphore.second, nullptr);
+   }
+   submissions_in_flight_semaphores_.clear();
++  nfsmw_vigia.Parar();  // PARCHE LOCAL - fences: antes de destruir los fences
+   for (VkFence& fence : submissions_in_flight_fences_) {
+     dfn.vkDestroyFence(device, fence, nullptr);
+   }
+@@ -2275,6 +2462,95 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
++  nfscarbon_census_on.store(REXCVAR_GET(gpu_census), std::memory_order_relaxed);
++  nfscarbon_cp_tid.store(int32_t(gettid()), std::memory_order_relaxed);
++  if (REXCVAR_GET(gpu_census)) {
++    GpuCensus& c = g_census;
++    uint64_t now = GpuCensus::NowNs();
++    if (c.frame_start_ns) {
++      c.frame_cp_ns_sum += now - c.frame_start_ns;
++    }
++    c.frame_start_ns = now;
++    std::sort(c.frame_pairs.begin(), c.frame_pairs.end());
++    c.frame_pairs.erase(std::unique(c.frame_pairs.begin(), c.frame_pairs.end()),
++                        c.frame_pairs.end());
++    c.unique_pairs_sum += c.frame_pairs.size();
++    for (uint64_t key : c.frame_pairs) {
++      auto it = std::lower_bound(c.seen_pairs.begin(), c.seen_pairs.end(), key);
++      if (it == c.seen_pairs.end() || *it != key) {
++        c.seen_pairs.insert(it, key);
++        ++c.new_pairs_total;
++      }
++    }
++    c.frame_pairs.clear();
++    c.last_framebuffer = nullptr;
++    ++c.frames;
++    const uint64_t interval = uint64_t(std::max<int32_t>(1, REXCVAR_GET(gpu_census_interval)));
++    if (c.frames >= interval) {
++      const double f = double(c.frames);
++      const double d = double(std::max<uint64_t>(1, c.draws));
++      REXGPU_INFO(
++          "[census] frames={} draws/f={:.0f} passes/f={:.1f} copies/f={:.1f} "
++          "pairs/f={:.1f} pairs_seen={} placeholder/f={:.1f} "
++          "frame_ms={:.2f} draw_ms/f={:.2f} copy_ms/f={:.2f} us/draw={:.2f} "
++          "[us/draw prim={:.2f} xlat={:.2f} tex={:.2f} rt={:.2f} pipe={:.2f} state={:.2f} "
++          "rec={:.2f}]",
++          c.frames, c.draws / f, c.passes / f, c.copies / f, c.unique_pairs_sum / f,
++          c.seen_pairs.size(), c.placeholder_draws / f, c.frame_cp_ns_sum / f / 1e6,
++          c.draw_ns / f / 1e6, c.copy_ns / f / 1e6, c.draw_ns / d / 1e3,
++          c.step_ns[GpuCensus::kStepPrimitive] / d / 1e3,
++          c.step_ns[GpuCensus::kStepTranslate] / d / 1e3,
++          c.step_ns[GpuCensus::kStepTextures] / d / 1e3,
++          c.step_ns[GpuCensus::kStepRenderTargets] / d / 1e3,
++          c.step_ns[GpuCensus::kStepPipeline] / d / 1e3,
++          c.step_ns[GpuCensus::kStepState] / d / 1e3,
++          c.step_ns[GpuCensus::kStepRecord] / d / 1e3);
++      CensusExtern now_ext;
++      now_ext.protect_calls = nfscarbon_protect_calls.load(std::memory_order_relaxed);
++      now_ext.protect_ns = nfscarbon_protect_ns.load(std::memory_order_relaxed);
++      now_ext.protect_old = nfscarbon_protect_old_calls.load(std::memory_order_relaxed);
++      now_ext.sm_calls = nfscarbon_sm_calls.load(std::memory_order_relaxed);
++      now_ext.sm_uploads = nfscarbon_sm_uploads.load(std::memory_order_relaxed);
++      now_ext.sm_pages = nfscarbon_sm_upload_pages.load(std::memory_order_relaxed);
++      now_ext.sm_ns = nfscarbon_sm_upload_ns.load(std::memory_order_relaxed);
++      now_ext.inval = nfscarbon_sm_invalidations.load(std::memory_order_relaxed);
++      now_ext.inval_pages = nfscarbon_sm_invalidated_pages.load(std::memory_order_relaxed);
++      const CensusExtern& b = g_census_extern_base;
++      REXGPU_INFO(
++          "[census2] vtxranges us/draw={:.2f} | mprotect/f={:.1f} (old_access/f={:.1f}) ms/f={:.2f} | "
++          "sm requests/f={:.1f} uploads/f={:.1f} pages/f={:.1f} upload_ms/f={:.2f} | "
++          "invalidations/f={:.1f} inval_pages/f={:.1f}",
++          c.step_ns[GpuCensus::kStepVertexRanges] / d / 1e3,
++          (now_ext.protect_calls - b.protect_calls) / f,
++          (now_ext.protect_old - b.protect_old) / f, (now_ext.protect_ns - b.protect_ns) / f / 1e6,
++          (now_ext.sm_calls - b.sm_calls) / f, (now_ext.sm_uploads - b.sm_uploads) / f,
++          (now_ext.sm_pages - b.sm_pages) / f, (now_ext.sm_ns - b.sm_ns) / f / 1e6,
++          (now_ext.inval - b.inval) / f, (now_ext.inval_pages - b.inval_pages) / f);
++      g_census_extern_base = now_ext;
++      {
++        uintptr_t keys[32];
++        uint64_t calls[32], ns[32], bytes[32];
++        const size_t n = nfscarbon_protect_sites_dump(keys, calls, ns, bytes, 32);
++        for (size_t i = 0; i < n; ++i) {
++          if (calls[i] / f >= 5.0) {
++            Dl_info info = {};
++            const void* ra = reinterpret_cast<const void*>(keys[i] & ~uintptr_t(1));
++            const bool have = dladdr(ra, &info) && info.dli_fname;
++            REXGPU_INFO(
++                "[census3] mprotect site {}+{:#x} thread={} calls/f={:.1f} ms/f={:.2f} KB/call={:.0f}",
++                have ? info.dli_fname : "?",
++                have ? uintptr_t(ra) - uintptr_t(info.dli_fbase) : uintptr_t(ra),
++                (keys[i] & 1) ? "CP" : "other", calls[i] / f, ns[i] / f / 1e6,
++                bytes[i] / double(std::max<uint64_t>(1, calls[i])) / 1024.0);
++          }
++        }
++      }
++      c.frames = c.draws = c.copies = c.passes = c.placeholder_draws = 0;
++      c.draw_ns = c.copy_ns = c.unique_pairs_sum = c.frame_cp_ns_sum = 0;
++      for (uint64_t& v : c.step_ns) v = 0;
++    }
++  }
++
+   if (!graphics_system_)
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+@@ -2395,6 +2671,53 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           frontbuffer_width_scaled, frontbuffer_height_scaled);
+     }
+   }
++  // FPS del juego: ventana corta de 0.5 s hacia el runtime (contador en
++  // pantalla) y linea cada 5 s en el log con el peor fotograma del periodo.
++  {
++    using RelojFps = std::chrono::steady_clock;
++    static RelojFps::time_point fps_desde{};
++    static RelojFps::time_point fps_desde_corto{};
++    static RelojFps::time_point fps_anterior{};
++    static uint32_t fps_cuenta = 0;
++    static uint32_t fps_cuenta_corta = 0;
++    static double fps_peor_ms = 0.0;
++    const auto fps_ahora = RelojFps::now();
++    if (fps_desde == RelojFps::time_point{}) {
++      fps_desde = fps_ahora;
++      fps_desde_corto = fps_ahora;
++      fps_anterior = fps_ahora;
++    } else {
++      ++fps_cuenta;
++      ++fps_cuenta_corta;
++      const double fps_este_ms =
++          std::chrono::duration<double, std::milli>(fps_ahora - fps_anterior).count();
++      if (fps_este_ms > fps_peor_ms) {
++        fps_peor_ms = fps_este_ms;
++      }
++      fps_anterior = fps_ahora;
++      const double fps_corto =
++          std::chrono::duration<double>(fps_ahora - fps_desde_corto).count();
++      if (fps_corto >= 0.5) {
++#if REX_PLATFORM_ANDROID
++        rex_gpu_report_fps(float(fps_cuenta_corta / fps_corto),
++                           float(fps_corto * 1000.0 / fps_cuenta_corta), float(fps_peor_ms));
++#endif
++        fps_cuenta_corta = 0;
++        fps_peor_ms = 0.0;
++        fps_desde_corto = fps_ahora;
++      }
++      const double fps_segundos = std::chrono::duration<double>(fps_ahora - fps_desde).count();
++      if (fps_segundos >= 5.0) {
++        REXGPU_INFO(
++            "fps: {:.1f} ({} frames in {:.1f} s, {:.1f} ms per frame, worst {:.1f} ms)",
++            fps_cuenta / fps_segundos, fps_cuenta, fps_segundos,
++            fps_segundos * 1000.0 / fps_cuenta, fps_peor_ms);
++        fps_cuenta = 0;
++        fps_peor_ms = 0.0;
++        fps_desde = fps_ahora;
++      }
++    }
++  }
+   REXGPU_DEBUG(
+       "XELOG_GPU PRESENT: swap_texture_view={:p} packet_size={}x{} src_size={}x{} "
+       "src_unscaled={}x{} guest_output_size={}x{} format={}",
+@@ -3117,6 +3440,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  // PARCHE LOCAL - subidas adelantadas: aqui empieza el pase en el flujo.
++  nfsmw_inicio_pase_ = deferred_command_buffer_.NfsmwTamano();
++  if (shared_memory_) {
++    shared_memory_->NfsmwEmpezarPase();
++  }
+ 
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
+@@ -3191,6 +3519,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+   current_framebuffer_ = framebuffer;
++  // PARCHE LOCAL - subidas adelantadas: aqui empieza el pase en el flujo.
++  nfsmw_inicio_pase_ = deferred_command_buffer_.NfsmwTamano();
++  if (shared_memory_) {
++    shared_memory_->NfsmwEmpezarPase();
++  }
+ 
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachment = {};
+@@ -3255,6 +3588,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
++  nfsmw_inicio_pase_ = SIZE_MAX;  // PARCHE LOCAL - subidas adelantadas
+   if (!in_render_pass_) {
+     return;
+   }
+@@ -3596,6 +3930,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
++  const bool census = REXCVAR_GET(gpu_census);
++  uint64_t census_t0 = 0, census_last = 0;
++  if (census) {
++    census_t0 = census_last = GpuCensus::NowNs();
++  }
++  auto census_lap = [&](GpuCensus::Step step) {
++    if (!census) {
++      return;
++    }
++    uint64_t now = GpuCensus::NowNs();
++    g_census.step_ns[step] += now - census_last;
++    census_last = now;
++  };
+   auto draw_fail = [&](const char* stage) {
+     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+     REXGPU_ERROR(
+@@ -3711,6 +4058,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     if (!primitive_processor_->Process(primitive_processing_result)) {
+       return draw_fail("primitive_processing");
+     }
++    census_lap(GpuCensus::kStepPrimitive);
+     if (!primitive_processing_result.host_draw_vertex_count) {
+       // Nothing to draw.
+       return true;
+@@ -3753,6 +4101,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                      : nullptr;
++    if (census) {
++      g_census.frame_pairs.push_back(vertex_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull ^
++                                     (pixel_shader ? pixel_shader->ucode_data_hash() : 0));
++    }
+     if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                   pixel_shader_translation)) {
+       return draw_fail("shader_translation");
+@@ -3835,7 +4187,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  census_lap(GpuCensus::kStepTranslate);
+   texture_cache_->RequestTextures(used_texture_mask);
++  census_lap(GpuCensus::kStepTextures);
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+@@ -3843,6 +4197,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+   }
++  census_lap(GpuCensus::kStepRenderTargets);
++  if (census) {
++    const void* fb = static_cast<const void*>(render_target_cache_->last_update_framebuffer());
++    if (fb != g_census.last_framebuffer) {
++      g_census.last_framebuffer = fb;
++      ++g_census.passes;
++    }
++  }
+ 
+   // Create the pipeline (for this, need the render pass from the render target
+   // cache), translating the shaders - doing this now to obtain the used
+@@ -3856,6 +4218,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                           pipeline, pipeline_layout_provider, &pipeline_handle)) {
+     return draw_fail("configure_pipeline");
+   }
++  census_lap(GpuCensus::kStepPipeline);
+   bool pipeline_is_placeholder = false;
+   // Reload the current handle state to observe async hot-swap completions that
+   // may happen between pipeline configuration and binding.
+@@ -3863,6 +4226,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                                 &pipeline_is_placeholder);
+   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+     frame_used_async_placeholder_pipeline_ = true;
++    if (census) {
++      ++g_census.placeholder_draws;
++    }
+     return true;
+   }
+   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+@@ -3976,6 +4342,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   if (!UpdateBindings(vertex_shader, pixel_shader)) {
+     return draw_fail("update_bindings");
+   }
++  census_lap(GpuCensus::kStepState);
+ 
+   // Ensure vertex buffers are resident.
+   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+@@ -4027,6 +4394,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  census_lap(GpuCensus::kStepVertexRanges);
++
+   // Synchronize the memory pages backing memory scatter export streams, and
+   // calculate the range that includes the streams for the buffer barrier.
+   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
+@@ -4044,6 +4413,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         std::max(memexport_extent_end, memexport_range_base_bytes + memexport_range.size_bytes);
+   }
+   if (memexport_writes_possible && memexport_ranges_.empty()) {
++    // Diagnostic: this conservative path makes the full 512 MB shared memory
++    // resident, inserts a whole-buffer barrier for the draw and, after the
++    // draw, invalidates every watched texture. A title hitting this on every
++    // draw collapses on mobile memory bandwidth, and it is silent upstream.
++    static std::atomic<uint32_t> unresolved_memexport_draw_count{0};
++    const uint32_t unresolved_draw_index =
++        unresolved_memexport_draw_count.fetch_add(1, std::memory_order_relaxed);
++    if ((unresolved_draw_index % 60) == 0) {
++      REXGPU_WARN(
++          "Draw #{} with memexport-capable shader but unresolved export "
++          "destinations: using the full {} MiB shared memory range (resident "
++          "request, whole-buffer barrier, global texture invalidation). If "
++          "frame rate is low, this path is a likely cause.",
++          unresolved_draw_index, uint32_t(SharedMemory::kBufferSize >> 20));
++    }
+     if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+       REXGPU_ERROR(
+           "Failed to request full shared memory residency for unresolved "
+@@ -4181,6 +4565,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  if (census) {
++    census_lap(GpuCensus::kStepRecord);
++    ++g_census.draws;
++    g_census.draw_ns += census_last - census_t0;
++  }
+   return true;
+ }
+ 
+@@ -4386,6 +4775,20 @@ bool VulkanCommandProcessor::IssueCopy() {
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(gpu_census)) {
++    struct CopyTimer {
++      uint64_t t0 = GpuCensus::NowNs();
++      ~CopyTimer() {
++        ++g_census.copies;
++        g_census.copy_ns += GpuCensus::NowNs() - t0;
++      }
++    } copy_timer;
++    return IssueCopyImpl();
++  }
++  return IssueCopyImpl();
++}
++
++bool VulkanCommandProcessor::IssueCopyImpl() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -4964,6 +5367,22 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+ 
+   size_t fences_total = submissions_in_flight_fences_.size();
+   size_t fences_awaited = 0;
++  // PARCHE LOCAL - fences: con el vigia no se pregunta al driver (en Turnip
++  // cada consulta costaba ~8-12 ms); se lee lo que el vigia ha visto acabar.
++  if (nfsmw_vigia.activo()) {
++    if (await_submission > submission_completed_) {
++      nfsmw_vigia.EsperarHasta(await_submission - nfsmw_vigia_base);
++    }
++    if (nfsmw_vigia.Perdido()) {
++      device_lost_ = true;
++    }
++    const uint64_t nfsmw_hechos = nfsmw_vigia.Completados() + nfsmw_vigia_base;
++    if (nfsmw_hechos > submission_completed_) {
++      fences_awaited =
++          size_t(std::min<uint64_t>(nfsmw_hechos - submission_completed_, fences_total));
++    }
++    goto nfsmw_tras_consultar_fences;
++  }
+   if (await_submission > submission_completed_) {
+     // Await in a blocking way if requested.
+     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
+@@ -4986,8 +5405,10 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   // submission themselves can be executed out of order, but Xenia serializes
+   // that for simplicity.
+   while (fences_awaited < fences_total) {
++    // PARCHE LOCAL - fences: vkGetFenceStatus en vez de vkWaitForFences con
++    // tiempo 0 (tools/parche_fences.py).
+     VkResult fence_status =
+-        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
++        dfn.vkGetFenceStatus(device, submissions_in_flight_fences_[fences_awaited]);
+     if (fence_status != VK_SUCCESS) {
+       if (fence_status == VK_ERROR_DEVICE_LOST) {
+         device_lost_ = true;
+@@ -4996,6 +5417,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     }
+     ++fences_awaited;
+   }
++nfsmw_tras_consultar_fences:  // PARCHE LOCAL - fences
+   if (device_lost_) {
+     if (graphics_system_) {
+       graphics_system_->OnHostGpuLossFromAnyThread(true);
+@@ -5111,7 +5533,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+   // is still available, and whether the await was successful.
+   uint64_t await_submission =
+       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+-  CheckSubmissionFenceAndDeviceLoss(await_submission);
++  // PARCHE LOCAL - fences: consultar solo al abrir fotograma o si hay algo
++  // que esperar; en Turnip cada consulta cuesta ~8 ms (tools/parche_fences.py).
++  if (is_opening_frame || await_submission) {
++    CheckSubmissionFenceAndDeviceLoss(await_submission);
++  }
+   if (device_lost_ || submission_completed_ < await_submission) {
+     return false;
+   }
+@@ -5440,6 +5866,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     // Increments the current submission number, going to the next submission.
+     submissions_in_flight_fences_.push_back(fence);
+     fences_free_.pop_back();
++    // PARCHE LOCAL - fences: el vigia espera a este fence. Arranca en el primer
++    // envio y se lleva todos los que haya en vuelo, en orden.
++    if (REXCVAR_GET(vulkan_vigia_fences)) {
++      if (!nfsmw_vigia.activo()) {
++        nfsmw_vigia_base = submission_completed_;
++        nfsmw_vigia.Iniciar(device, dfn.vkWaitForFences);
++        for (VkFence en_vuelo : submissions_in_flight_fences_) {
++          nfsmw_vigia.Encolar(en_vuelo);
++        }
++      } else {
++        nfsmw_vigia.Encolar(fence);
++      }
++    }
+ 
+     submission_open_ = false;
+   }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..8bf8a7a 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -22,6 +22,11 @@
+ #include <rex/string.h>
+ #include <rex/ui/vulkan/device.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
++                    "Enable device features used by the native renderer (int64, buffer device "
++                    "address, descriptor indexing, extended dynamic state 3)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
+                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
+                     "required for Vulkan GPU emulation")
+@@ -191,6 +196,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     // #238.
+     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
+   }
++  if (get_physical_device_properties2_supported && REXCVAR_GET(vulkan_native_shader_features)) {
++    // #456. Native renderer: dynamic blending and color write masks. Its three features are
++    // enabled further down, only if the device provides them.
++    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
++  }
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+     // #414.
+     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_maintenance4, 1, 3)
+@@ -335,6 +345,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
+       features_EXT_robustness2;
++  // Native renderer.
++  VulkanFeatures<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
++      features_EXT_extended_dynamic_state3;
+ 
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+@@ -376,6 +390,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (device->extensions_.ext_EXT_robustness2) {
+       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+     }
++    if (device->extensions_.ext_EXT_extended_dynamic_state3) {
++      features_EXT_extended_dynamic_state3.Link(supported_features_2, device_create_info);
++    }
+     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
+     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
+   }
+@@ -424,7 +441,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       queue_family.may_support_presentation = true;
+ #endif
+       if (queue_family.may_support_presentation) {
+-        queue_family.queues.resize(std::max(size_t(1), queue_family.queues.size()));
++        // PARCHE LOCAL - cola de presentar: una segunda cola, si la hay, para
++        // vkQueuePresentKHR (ver tools/parche_cola_presentar.py).
++        const size_t colas_presentar = queue_family_properties.queueCount >= 2 ? 2 : 1;
++        queue_family.queues.resize(std::max(colas_presentar, queue_family.queues.size()));
+         has_presentation_queue_family = true;
+       }
+     }
+@@ -646,11 +666,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   }
+ 
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+-    if (with_gpu_emulation) {
++    if (with_gpu_emulation || REXCVAR_GET(vulkan_native_shader_features)) {
+       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+     }
++    if (REXCVAR_GET(vulkan_native_shader_features)) {
++      XE_UI_VULKAN_FEATURE(shaderInt64)
++      XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
++      XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
++      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
++      XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
++      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
++      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
++      XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
++      if (!with_gpu_emulation) {
++        XE_UI_VULKAN_FEATURE(independentBlend)
++        XE_UI_VULKAN_FEATURE(samplerAnisotropy)
++        XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
++      }
++    }
+   } else {
+     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
+       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
+@@ -731,6 +766,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+   }
+ 
++  if (device->extensions_.ext_EXT_extended_dynamic_state3) {
++    // Only the three the native renderer uses: blending, its equation and the write mask of each
++    // render target are set with vkCmdSet* instead of the pipeline's pAttachments.
++    XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEnable)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEquation)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorWriteMask)
++  }
++
+ #undef XE_UI_VULKAN_LIMIT
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+ #undef XE_UI_VULKAN_FEATURE

@@ -1,0 +1,24 @@
+# Apply on top of rexglue-android.patch. Adds the achievement_toasts setting.
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -51,6 +51,11 @@
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// LOCAL CHANGE - the toast dialog lives for the whole run, and while any ImGui
++// dialog exists the UI repaints at every display refresh. Phones turn it off.
++REXCVAR_DEFINE_BOOL(achievement_toasts, true, "UI",
++                    "Show achievement unlock toasts (keeps the UI repainting every refresh)");
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -444,7 +449,7 @@
+     // Register the achievement notification callback now that the runtime and
+     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
+     // because KernelState is null during SetupPresentation.
+-    if (!achievement_notification_) {
++    if (!achievement_notification_ && REXCVAR_GET(achievement_toasts)) {
+       achievement_notification_ =
+           std::shared_ptr<ui::AchievementNotificationDialog>(CreateAchievementNotificationDialog());
+     }

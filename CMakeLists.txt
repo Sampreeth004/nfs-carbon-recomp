@@ -36,6 +36,10 @@ if(ANDROID)
     list(APPEND NFSCARBON_SOURCES src/thread_affinity.cpp)
     # Futex sleep instead of a busy spin while D3D waits for ring space.
     list(APPEND NFSCARBON_SOURCES src/ring_wait_hook.cpp)
+    # Retail render mode 2 (one tile, no MSAA) for the scene: removes the tiling/MSAA redraws.
+    list(APPEND NFSCARBON_SOURCES src/render_mode_hook.cpp)
+    # Stereo AAudio output instead of the SDL 5.1 stream.
+    list(APPEND NFSCARBON_SOURCES src/android_aaudio.cpp)
 endif()
 
 if(WIN32)
@@ -44,6 +48,7 @@ if(WIN32)
 elseif(ANDROID)
     # SDLActivity loads the game as a shared library.
     add_library(nfscarbon SHARED ${NFSCARBON_SOURCES})
+    target_link_libraries(nfscarbon PRIVATE aaudio)
 else()
     add_executable(nfscarbon ${NFSCARBON_SOURCES})
 endif()
@@ -53,6 +58,13 @@ if(WIN32)
 endif()
 
 rexglue_setup_target(nfscarbon GPU_PLUGINS xenos)
+
+# Native Vulkan renderer plugin (gpu_plugin = "carbon"), see renderer/.
+option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugin" ON)
+if(NFSCARBON_BUILD_CARBON_GPU)
+    add_subdirectory(renderer)
+    add_dependencies(nfscarbon rexgpu-carbon)
+endif()
 
 if(ANDROID)
     # The NDK defaults to per-function sections; with ~72k recompiled functions
@@ -66,5 +78,28 @@ if(ANDROID)
     if(TARGET nfscarbon_recomp)
         target_compile_options(nfscarbon_recomp PRIVATE
             -fno-function-sections -fno-data-sections)
+    endif()
+    # Every phone this targets has ARMv8.2 (LSE atomics for the guest's
+    # reservation loads/stores, among others).
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        foreach(target nfscarbon nfscarbon_recomp)
+            if(TARGET ${target})
+                target_compile_options(${target} PRIVATE -march=armv8.2-a)
+            endif()
+        endforeach()
+    endif()
+    # ThinLTO over the game code and the app. With tools/direct_calls.py applied,
+    # calls between unhooked game functions go to __imp__sub_X and can be inlined
+    # across files.
+    option(NFSCARBON_ANDROID_LTO "ThinLTO over the game code (Android, Release)" ON)
+    if(NFSCARBON_ANDROID_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+        foreach(target nfscarbon nfscarbon_recomp)
+            if(TARGET ${target})
+                target_compile_options(${target} PRIVATE -flto=thin)
+            endif()
+        endforeach()
+        cmake_host_system_information(RESULT NFSCARBON_CORES QUERY NUMBER_OF_LOGICAL_CORES)
+        target_link_options(nfscarbon PRIVATE -flto=thin "LINKER:--thinlto-jobs=${NFSCARBON_CORES}"
+                            "LINKER:--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
     endif()
 endif()

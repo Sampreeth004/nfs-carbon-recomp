@@ -31,3 +31,6 @@ android/app/build/
 android/app/src/main/jniLibs/
 android/local.properties
 *.apk
+
+# Frame dumps from carbon_gpu_dump_frame_interval
+carbon_frames/

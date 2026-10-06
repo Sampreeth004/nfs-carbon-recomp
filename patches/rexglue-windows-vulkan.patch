@@ -1,0 +1,60 @@
+--- a/src/graphics/vulkan/command_processor.cpp	2026-10-06 07:52:29.579809400 +0530
++++ b/src/graphics/vulkan/command_processor.cpp	2026-10-06 07:52:29.595825100 +0530
+@@ -9,8 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#if !defined(_WIN32)
+ #include <dlfcn.h>
+ #include <unistd.h>
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -239,6 +241,19 @@
+ };
+ GpuCensus g_census;
+ 
++#if defined(_WIN32)
++// The census counters live in memory_posix.cpp; Windows builds get local dummies.
++static std::atomic<bool> nfscarbon_census_on{false};
++static std::atomic<uint64_t> nfscarbon_protect_calls{0}, nfscarbon_protect_ns{0},
++    nfscarbon_protect_old_calls{0}, nfscarbon_sm_calls{0}, nfscarbon_sm_uploads{0},
++    nfscarbon_sm_upload_pages{0}, nfscarbon_sm_upload_ns{0}, nfscarbon_sm_invalidations{0},
++    nfscarbon_sm_invalidated_pages{0};
++static std::atomic<int32_t> nfscarbon_cp_tid{0};
++static size_t nfscarbon_protect_sites_dump(uintptr_t*, uint64_t*, uint64_t*, uint64_t*, size_t) {
++  return 0;
++}
++static int32_t gettid() { return 0; }
++#else
+ extern "C" {
+ extern std::atomic<bool> nfscarbon_census_on;
+ extern std::atomic<uint64_t> nfscarbon_protect_calls;
+@@ -253,6 +268,7 @@
+ extern std::atomic<uint64_t> nfscarbon_sm_invalidated_pages;
+ size_t nfscarbon_protect_sites_dump(uintptr_t*, uint64_t*, uint64_t*, uint64_t*, size_t);
+ }
++#endif
+ struct CensusExtern {
+   uint64_t protect_calls = 0, protect_ns = 0, protect_old = 0;
+   uint64_t sm_calls = 0, sm_uploads = 0, sm_pages = 0, sm_ns = 0, inval = 0, inval_pages = 0;
+@@ -2533,9 +2549,17 @@
+         const size_t n = nfscarbon_protect_sites_dump(keys, calls, ns, bytes, 32);
+         for (size_t i = 0; i < n; ++i) {
+           if (calls[i] / f >= 5.0) {
+-            Dl_info info = {};
+             const void* ra = reinterpret_cast<const void*>(keys[i] & ~uintptr_t(1));
++#if defined(_WIN32)
++            struct {
++              const char* dli_fname = nullptr;
++              const void* dli_fbase = nullptr;
++            } info;
++            const bool have = false;
++#else
++            Dl_info info = {};
+             const bool have = dladdr(ra, &info) && info.dli_fname;
++#endif
+             REXGPU_INFO(
+                 "[census3] mprotect site {}+{:#x} thread={} calls/f={:.1f} ms/f={:.2f} KB/call={:.0f}",
+                 have ? info.dli_fname : "?",

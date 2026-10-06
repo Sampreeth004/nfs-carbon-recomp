@@ -6,6 +6,9 @@
 #include <jni.h>
 
 #include <cstdint>
+#include <dlfcn.h>
+
+#include "android_aaudio.h"
 
 // Defined in librexruntime.so (rex/input/touchpad/touchpad_input_driver.cpp).
 extern "C" {
@@ -61,4 +64,21 @@ Java_com_eagames_nfscarbon_GameBridge_nativeGetGuestFrameMs(JNIEnv*, jclass) {
 extern "C" JNIEXPORT jfloat JNICALL
 Java_com_eagames_nfscarbon_GameBridge_nativeGetGuestWorstMs(JNIEnv*, jclass) {
   return rex_gpu_get_worst_ms();
+}
+
+// App lifecycle: park the renderer's command thread and the audio output while
+// the app is in the background, so the game stops using the CPU and GPU.
+extern "C" JNIEXPORT void JNICALL Java_com_eagames_nfscarbon_GameBridge_nativeSetGamePaused(
+    JNIEnv*, jclass, jboolean paused) {
+  using SetPausedFn = void (*)(int);
+  static SetPausedFn set_paused = []() -> SetPausedFn {
+    if (void* plugin = dlopen("librexgpu-carbon.so", RTLD_NOW | RTLD_NOLOAD)) {
+      return reinterpret_cast<SetPausedFn>(dlsym(plugin, "carbon_gpu_set_paused"));
+    }
+    return nullptr;
+  }();
+  if (set_paused) {
+    set_paused(paused ? 1 : 0);
+  }
+  carbon::audio::SetOutputPaused(paused != JNI_FALSE);
 }

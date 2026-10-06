@@ -12,7 +12,8 @@
 //
 // Hook: if the read pointer has not moved since the watchdog's last look, sleep
 // on a futex until the CP publishes a new one (nfsmw_cp_rptr_seq, exported by
-// librexgpu-xenos.so), capped at 1 ms. Without that symbol it does nothing.
+// the loaded GPU plugin, librexgpu-carbon.so or librexgpu-xenos.so), capped at
+// 1 ms. Without that symbol it does nothing.
 //
 // Only for the two ring-space loops, recognized by return address. The other
 // watchdog callers wait on fences the CP writes mid-stream; sleeping there would
@@ -54,9 +55,14 @@ std::atomic<uint32_t>* RptrSequence() {
     if (__system_property_get("debug.nfscarbon.ring_wait", value) > 0 && value[0] == '0') {
       return nullptr;
     }
-    void* plugin = dlopen("librexgpu-xenos.so", RTLD_NOW | RTLD_NOLOAD);
-    return plugin ? static_cast<std::atomic<uint32_t>*>(dlsym(plugin, "nfsmw_cp_rptr_seq"))
-                  : nullptr;
+    for (const char* name : {"librexgpu-carbon.so", "librexgpu-xenos.so"}) {
+      if (void* plugin = dlopen(name, RTLD_NOW | RTLD_NOLOAD)) {
+        if (void* symbol = dlsym(plugin, "nfsmw_cp_rptr_seq")) {
+          return static_cast<std::atomic<uint32_t>*>(symbol);
+        }
+      }
+    }
+    return nullptr;
   }();
   return sequence;
 }

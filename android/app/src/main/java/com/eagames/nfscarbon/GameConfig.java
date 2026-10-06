@@ -27,9 +27,16 @@ public final class GameConfig {
     public static final String PREFS = "nfscarbon_prefs";
     public static final String TOML_NAME = "nfscarbon.toml";
 
+    // GPU plugin: "carbon" (native Vulkan renderer) or "xenos" (Xenos emulation).
+    public static final String KEY_RENDERER = "gpu_plugin";
     public static final String KEY_WIDTH = "video_mode_width";
     public static final String KEY_HEIGHT = "video_mode_height";
     public static final String KEY_VSYNC = "vsync";
+    public static final String KEY_BLOOM = "bloom";
+    public static final String KEY_FPS_CAP = "fps_cap";
+    public static final String KEY_RENDER_SCALE = "render_scale";
+    public static final String KEY_REFLECTIONS = "reflection_faces";
+    public static final String KEY_MIRROR_HALF = "mirror_half_rate";
     public static final String KEY_MSAA = "native_2x_msaa";
     public static final String KEY_MSAA_SAMPLES = "msaa_samples";
     public static final String KEY_FXAA = "swap_post_effect";
@@ -57,6 +64,7 @@ public final class GameConfig {
     public static final int DEFAULT_HEIGHT = 720;
     public static final int DEFAULT_MSAA_SAMPLES = 0;
     public static final String DEFAULT_FXAA = "none";
+    public static final String DEFAULT_RENDERER = "carbon";
     public static final String DEFAULT_UPSCALER = "bilinear";
     public static final String DEFAULT_LAYOUT = "xbox";
     public static final float DEFAULT_OPACITY = 0.55f;
@@ -85,9 +93,16 @@ public final class GameConfig {
         int guestHeight = p.getInt(KEY_HEIGHT, DEFAULT_HEIGHT);
 
         Map<String, String> values = new LinkedHashMap<>();
+        values.put(KEY_RENDERER, quote(p.getString(KEY_RENDERER, DEFAULT_RENDERER)));
         values.put(KEY_WIDTH, String.valueOf(guestWidth));
         values.put(KEY_HEIGHT, String.valueOf(guestHeight));
         values.put(KEY_VSYNC, bool(p.getBoolean(KEY_VSYNC, true)));
+        values.put("carbon_gpu_bloom", bool(p.getBoolean(KEY_BLOOM, false)));
+        values.put("achievement_toasts", "false");
+        values.put("carbon_gpu_render_scale", String.valueOf(p.getInt(KEY_RENDER_SCALE, 100)));
+        values.put("carbon_gpu_fps_cap", String.valueOf(p.getInt(KEY_FPS_CAP, 60)));
+        values.put("carbon_gpu_reflection_faces", String.valueOf(p.getInt(KEY_REFLECTIONS, 2)));
+        values.put("carbon_gpu_mirror_half_rate", bool(p.getBoolean(KEY_MIRROR_HALF, true)));
         // MSAA off by default: on Adreno the Xenos path is much faster at 1
         // sample. "native_2x_msaa" only gates the host's 2x attachment support.
         int msaaSamples = p.getInt(KEY_MSAA_SAMPLES, DEFAULT_MSAA_SAMPLES);
