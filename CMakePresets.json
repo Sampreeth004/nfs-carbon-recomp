@@ -89,6 +89,16 @@
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
         },
         {
+            "name": "win-amd64-vk",
+            "displayName": "Windows AMD64 Release (Vulkan SDK)",
+            "description": "Release build against the patched SDK built with REXGLUE_USE_VULKAN=ON",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue-sdk-win-vk"
+            }
+        },
+        {
             "name": "linux-amd64-debug",
             "displayName": "Linux AMD64 Debug",
             "inherits": "linux-base",
@@ -188,6 +198,7 @@
     "buildPresets": [
         { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
         { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
+        { "name": "win-amd64-vk", "configurePreset": "win-amd64-vk" },
         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
         { "name": "linux-amd64-debug", "configurePreset": "linux-amd64-debug" },
         { "name": "linux-amd64-release", "configurePreset": "linux-amd64-release" },

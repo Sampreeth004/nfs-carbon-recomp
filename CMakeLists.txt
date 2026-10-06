@@ -56,6 +56,13 @@ endif()
 
 rexglue_setup_target(nfscarbon GPU_PLUGINS xenos)
 
+# Native Vulkan renderer plugin (gpu_plugin = "carbon"), see renderer/.
+option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugin" ON)
+if(NFSCARBON_BUILD_CARBON_GPU)
+    add_subdirectory(renderer)
+    add_dependencies(nfscarbon rexgpu-carbon)
+endif()
+
 if(ANDROID)
     # The NDK defaults to per-function sections; with ~72k recompiled functions
     # that overflows ELF's 16-bit section count and breaks strip/dlopen. Merge

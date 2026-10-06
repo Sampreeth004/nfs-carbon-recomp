@@ -94,7 +94,17 @@ class NfsCarbonApp : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    config.gpu_plugin = "xenos";
+    // "carbon" is the native renderer (renderer/); "xenos" the SDK's Xenos
+    // emulation, kept as a fallback selectable with gpu_plugin in the TOML.
+    // Android keeps xenos as the default until rexgpu-carbon is packaged in
+    // the APK.
+    if (config.gpu_plugin.empty()) {
+#if defined(__ANDROID__)
+      config.gpu_plugin = "xenos";
+#else
+      config.gpu_plugin = "carbon";
+#endif
+    }
 
 #ifndef __ANDROID__
     // On Android the launcher writes these keys to the TOML config, and

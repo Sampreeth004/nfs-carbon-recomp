@@ -100,3 +100,11 @@ Method that works without MW code: find the functions by behaviour in our `guest
   Next: confirm `0x826EB210` and its VS/PS siblings by reading the generated C++ and matching that shape; then the device-state
   functions (FlushState, Draw*, IM_LOAD callers) by their register-mirror layout and the PM4 packet writers.
 - Offsets inside the device differ per game (ring pointer 10384 in MW vs 10768 in Carbon), so each hook's offsets are re-derived too.
+
+### 2026-10-06: direction change, own renderer instead of a port
+
+The renderer is now written from scratch as the plugin `renderer/` (`rexgpu-carbon`), not ported
+from nfsmw-android, and needs no game-side hooks: shaders are translated from the microcode that
+reaches the ring (so Direct3D's vertex-shader patching does not matter) and compiled to SPIR-V at
+runtime with a disk cache. Nothing from nfsmw-android is copied, so the GPL-3.0 constraint above
+does not apply to it. Design, status and known problems: `CHANGELOG.md` (Unreleased).
