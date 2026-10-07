@@ -12,6 +12,7 @@
 #include <chrono>
 #include <climits>
 
+#include <rex/cvar.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
@@ -28,6 +29,10 @@
 // counter instead of spinning while D3D waits for ring space. Same name as
 // the SDK plugin exports, so the hook finds either renderer.
 extern "C" REX_GPU_PLUGIN_EXPORT std::atomic<uint32_t> nfsmw_cp_rptr_seq{0};
+
+REXCVAR_DEFINE_BOOL(carbon_gpu_threaded_cp, true, "CarbonGPU",
+                    "Fetch PM4 packets on a separate thread so the game never waits for ring "
+                    "space while draws are recorded (false = single command thread)");
 
 namespace carbon::gpu {
 
@@ -49,6 +54,8 @@ CommandProcessor::CommandProcessor(GpuSystem* system, Renderer* renderer)
     : system_(system), renderer_(renderer), memory_(system->memory()) {
   write_ptr_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   vblank_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  exec_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  space_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   // Linear gamma ramps until the game writes its own.
   for (uint32_t i = 0; i < 256; ++i) {
     uint32_t v = i * 0x3FF / 0xFF;
@@ -67,13 +74,36 @@ CommandProcessor::~CommandProcessor() { Stop(); }
 
 bool CommandProcessor::Start() {
   running_ = true;
+  threaded_ = REXCVAR_GET(carbon_gpu_threaded_cp);
+  if (threaded_) {
+    staging_ = std::make_unique_for_overwrite<uint32_t[]>(kStagingDwords);
+    staging_head_.store(0);
+    staging_tail_.store(0);
+    fetch_head_ = 0;
+  }
+  REXGPU_INFO("[carbon-gpu] command processing: {}",
+              threaded_ ? "fetch thread + executor thread" : "single thread");
+  // The executor keeps the name the CPU affinity rules pin to the fast cores.
   worker_ = rex::system::object_ref<rex::system::XHostThread>(new rex::system::XHostThread(
       system_->kernel_state(), 256 * 1024, 0, [this]() {
-        WorkerMain();
+        if (threaded_) {
+          ExecutorMain();
+        } else {
+          WorkerMain();
+        }
         return 0;
       }));
   worker_->set_name("GPU Commands");
   worker_->Create();
+  if (threaded_) {
+    fetch_worker_ = rex::system::object_ref<rex::system::XHostThread>(new rex::system::XHostThread(
+        system_->kernel_state(), 256 * 1024, 0, [this]() {
+          FetchMain();
+          return 0;
+        }));
+    fetch_worker_->set_name("GPU Fetch");
+    fetch_worker_->Create();
+  }
   return true;
 }
 
@@ -84,8 +114,15 @@ void CommandProcessor::Stop() {
   running_ = false;
   write_ptr_event_->Set();
   vblank_event_->Set();
+  exec_event_->Set();
+  space_event_->Set();
+  if (fetch_worker_) {
+    fetch_worker_->Wait(0, 0, 0, nullptr);
+    fetch_worker_.reset();
+  }
   worker_->Wait(0, 0, 0, nullptr);
   worker_.reset();
+  staging_.reset();
 }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -116,6 +153,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
   }
   has_pending_.store(true, std::memory_order_release);
   write_ptr_event_->Set();
+  exec_event_->Set();
 }
 
 void CommandProcessor::WorkerMain() {
@@ -210,6 +248,289 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Threaded mode: fetch (stage packets) and execute
+// ---------------------------------------------------------------------------
+
+void CommandProcessor::FetchMain() {
+  REXGPU_INFO("[carbon-gpu] command fetch thread started");
+  while (running_) {
+    uint32_t write_index = write_ptr_index_.load(std::memory_order_acquire);
+    if (write_index == 0xBAADF00Du || write_index == read_ptr_index_ ||
+        !primary_buffer_size_dwords_) {
+      uint32_t spins = 0;
+      while (running_) {
+        write_index = write_ptr_index_.load(std::memory_order_acquire);
+        if (write_index != 0xBAADF00Du && write_index != read_ptr_index_ &&
+            primary_buffer_size_dwords_) {
+          break;
+        }
+        if (++spins > 16) {
+          rex::thread::Wait(write_ptr_event_.get(), false, std::chrono::milliseconds(2));
+        } else {
+          rex::thread::MaybeYield();
+        }
+      }
+      continue;
+    }
+    read_ptr_index_ = FetchPrimaryBuffer(read_ptr_index_, write_index);
+    PublishReadPointer(read_ptr_index_);
+  }
+}
+
+uint32_t CommandProcessor::FetchPrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+  Reader r;
+  r.base = memory_->TranslatePhysical<const uint32_t*>(primary_buffer_ptr_);
+  r.capacity = primary_buffer_size_dwords_;
+  r.read = read_index & (primary_buffer_size_dwords_ - 1);
+  r.end = write_index & (primary_buffer_size_dwords_ - 1);
+  r.ring = true;
+  const uint32_t step = read_ptr_update_dwords_;
+  uint32_t published_remaining = r.remaining();
+  while (r.remaining()) {
+    if (!StagePacket(r, 0)) {
+      if (running_) {
+        REXGPU_ERROR("[carbon-gpu] bad packet in the primary ring at {:08X}, skipping the rest",
+                     primary_buffer_ptr_ + r.read * 4);
+      }
+      break;
+    }
+    // The packets are copied into the queue, so the ring space can be given back
+    // right away (the hardware read pointer is a fetch pointer too).
+    const uint32_t left = r.remaining();
+    if (step && left <= published_remaining && published_remaining - left >= step) {
+      PublishReadPointer(r.read);
+      published_remaining = left;
+    }
+  }
+  exec_event_->Set();
+  return write_index;
+}
+
+void CommandProcessor::FetchIndirectBuffer(uint32_t ptr, uint32_t count, uint32_t depth) {
+  Reader r;
+  r.base = memory_->TranslatePhysical<const uint32_t*>(ptr);
+  r.capacity = count;
+  r.read = 0;
+  r.end = count;
+  r.ring = false;
+  while (r.remaining()) {
+    if (!StagePacket(r, depth)) {
+      if (running_) {
+        REXGPU_ERROR("[carbon-gpu] bad packet in an indirect buffer at {:08X}", ptr);
+      }
+      break;
+    }
+  }
+}
+
+// Frames one packet at the reader and stages it for the executor. Mirrors the
+// framing, predication and bin-state rules of ExecutePacket/ExecuteType3; indirect
+// buffers are expanded here, so the executor never sees INDIRECT_BUFFER packets.
+bool CommandProcessor::StagePacket(Reader& r, uint32_t depth) {
+  auto raw_index = [&](uint32_t i) {
+    return r.ring ? ((r.read + i) & (r.capacity - 1)) : r.read + i;
+  };
+  const uint32_t packet = ByteSwap32(r.base[r.read]);
+  if (packet == 0) {
+    r.Skip(1);
+    return true;
+  }
+  switch (packet >> 30) {
+    case 0: {
+      const uint32_t total = ((packet >> 16) & 0x3FFF) + 2;
+      if (r.remaining() < total) {
+        return false;
+      }
+      return StagingWrite(r, total);
+    }
+    case 1:
+      if (r.remaining() < 3) {
+        return false;
+      }
+      return StagingWrite(r, 3);
+    case 2:
+      r.Skip(1);
+      return true;
+    default:
+      break;
+  }
+  const uint32_t total = ((packet >> 16) & 0x3FFF) + 2;
+  if (r.remaining() < total) {
+    return false;
+  }
+  auto peek = [&](uint32_t i) { return i < total ? ByteSwap32(r.base[raw_index(i)]) : 0u; };
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  if (packet & 1) {
+    if (!(fe_bin_select_ & fe_bin_mask_) || opcode == xenos::PM4_XE_SWAP) {
+      r.Skip(total);
+      return true;
+    }
+  }
+  switch (opcode) {
+    case xenos::PM4_INDIRECT_BUFFER:
+    case xenos::PM4_INDIRECT_BUFFER_PFD: {
+      const uint32_t list_ptr = peek(1) & 0x1FFFFFFF;
+      const uint32_t list_length = peek(2) & 0xFFFFF;
+      r.Skip(total);
+      if (depth < 8) {
+        FetchIndirectBuffer(list_ptr, list_length, depth + 1);
+      }
+      return true;
+    }
+    case xenos::PM4_SET_BIN_MASK_LO:
+      fe_bin_mask_ = (fe_bin_mask_ & 0xFFFFFFFF00000000ull) | peek(1);
+      break;
+    case xenos::PM4_SET_BIN_MASK_HI:
+      fe_bin_mask_ = (fe_bin_mask_ & 0xFFFFFFFFull) | (uint64_t(peek(1)) << 32);
+      break;
+    case xenos::PM4_SET_BIN_SELECT_LO:
+      fe_bin_select_ = (fe_bin_select_ & 0xFFFFFFFF00000000ull) | peek(1);
+      break;
+    case xenos::PM4_SET_BIN_SELECT_HI:
+      fe_bin_select_ = (fe_bin_select_ & 0xFFFFFFFFull) | (uint64_t(peek(1)) << 32);
+      break;
+    case xenos::PM4_SET_BIN_MASK:
+      fe_bin_mask_ = (uint64_t(peek(1)) << 32) | peek(2);
+      break;
+    case xenos::PM4_SET_BIN_SELECT:
+      fe_bin_select_ = (uint64_t(peek(1)) << 32) | peek(2);
+      break;
+    default:
+      break;
+  }
+  return StagingWrite(r, total);
+}
+
+// Copies `total` raw dwords from the reader into the queue (waiting for space) and
+// publishes them to the executor.
+bool CommandProcessor::StagingWrite(Reader& r, uint32_t total) {
+  const uint32_t mask = kStagingDwords - 1;
+  bool counted = false;
+  while (true) {
+    const uint32_t used = fetch_head_ - staging_tail_.load(std::memory_order_acquire);
+    if (used + total + 1 <= kStagingDwords) {
+      if (used + total > staged_max_.load(std::memory_order_relaxed)) {
+        staged_max_.store(used + total, std::memory_order_relaxed);
+      }
+      break;
+    }
+    if (!running_) {
+      return false;
+    }
+    if (!counted) {
+      counted = true;
+      fetch_full_waits_.fetch_add(1, std::memory_order_relaxed);
+    }
+    exec_event_->Set();
+    fetch_waiting_.store(true, std::memory_order_release);
+    if (fetch_head_ - staging_tail_.load(std::memory_order_acquire) + total + 1 <=
+        kStagingDwords) {
+      fetch_waiting_.store(false, std::memory_order_relaxed);
+      continue;
+    }
+    rex::thread::Wait(space_event_.get(), false, std::chrono::milliseconds(1));
+    fetch_waiting_.store(false, std::memory_order_relaxed);
+  }
+  uint32_t dst = fetch_head_ & mask;
+  uint32_t src = r.read;
+  uint32_t done = 0;
+  while (done < total) {
+    uint32_t run = total - done;
+    if (r.ring) {
+      run = std::min(run, r.capacity - src);
+    }
+    run = std::min(run, kStagingDwords - dst);
+    std::memcpy(staging_.get() + dst, r.base + src, size_t(run) * 4);
+    done += run;
+    src = r.ring ? ((src + run) & (r.capacity - 1)) : src + run;
+    dst = (dst + run) & mask;
+  }
+  r.Skip(total);
+  fetch_head_ += total;
+  staging_head_.store(fetch_head_, std::memory_order_release);
+  if (exec_sleeping_.load(std::memory_order_acquire)) {
+    exec_event_->Set();
+  }
+  return true;
+}
+
+void CommandProcessor::ExecutorMain() {
+  REXGPU_INFO("[carbon-gpu] command processor thread started (executor)");
+  renderer_->OnCommandThreadStart();
+  const uint32_t mask = kStagingDwords - 1;
+  uint32_t tail = 0;
+  auto last_report = std::chrono::steady_clock::now();
+  while (running_) {
+    if (has_pending_.load(std::memory_order_acquire)) {
+      std::vector<std::function<void()>> fns;
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        fns.swap(pending_);
+        has_pending_.store(false, std::memory_order_relaxed);
+      }
+      for (auto& fn : fns) {
+        fn();
+      }
+    }
+    uint32_t head = staging_head_.load(std::memory_order_acquire);
+    if (head == tail) {
+      uint32_t spins = 0;
+      while (running_ && !has_pending_.load(std::memory_order_acquire)) {
+        head = staging_head_.load(std::memory_order_acquire);
+        if (head != tail) {
+          break;
+        }
+        if (++spins > 16) {
+          auto idle_start = std::chrono::steady_clock::now();
+          exec_sleeping_.store(true, std::memory_order_release);
+          if (staging_head_.load(std::memory_order_acquire) == tail) {
+            rex::thread::Wait(exec_event_.get(), false, std::chrono::milliseconds(2));
+          }
+          exec_sleeping_.store(false, std::memory_order_relaxed);
+          renderer_->NoteCpIdle(std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - idle_start).count());
+        } else {
+          rex::thread::MaybeYield();
+        }
+      }
+      continue;
+    }
+    Reader r;
+    r.base = staging_.get();
+    r.capacity = kStagingDwords;
+    r.read = tail & mask;
+    r.end = head & mask;
+    r.ring = true;
+    while (r.remaining()) {
+      const uint32_t before = r.read;
+      if (!ExecutePacket(r)) {
+        if (running_) {
+          REXGPU_ERROR("[carbon-gpu] bad packet in the command queue, skipping the rest");
+        }
+        r.read = r.end;
+      }
+      tail += (r.read - before) & mask;
+      staging_tail_.store(tail, std::memory_order_release);
+      if (fetch_waiting_.load(std::memory_order_relaxed)) {
+        space_event_->Set();
+      }
+      if (!running_) {
+        break;
+      }
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_report >= std::chrono::seconds(5)) {
+      last_report = now;
+      REXGPU_INFO(
+          "[carbon-gpu] command queue: peak {} of {} KiB used, fetch waited for space {} times",
+          (staged_max_.exchange(0, std::memory_order_relaxed) * 4) >> 10,
+          (kStagingDwords * 4) >> 10, fetch_full_waits_.exchange(0, std::memory_order_relaxed));
+    }
+  }
+  renderer_->OnCommandThreadStop();
 }
 
 bool CommandProcessor::ExecutePacket(Reader& r) {

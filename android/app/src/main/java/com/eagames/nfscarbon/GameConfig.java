@@ -37,6 +37,7 @@ public final class GameConfig {
     public static final String KEY_RENDER_SCALE = "render_scale";
     public static final String KEY_REFLECTIONS = "reflection_faces";
     public static final String KEY_MIRROR_HALF = "mirror_half_rate";
+    public static final String KEY_THREADED_CP = "threaded_cp";
     public static final String KEY_MSAA = "native_2x_msaa";
     public static final String KEY_MSAA_SAMPLES = "msaa_samples";
     public static final String KEY_FXAA = "swap_post_effect";
@@ -109,6 +110,7 @@ public final class GameConfig {
         values.put("carbon_gpu_fps_cap", String.valueOf(p.getInt(KEY_FPS_CAP, 60)));
         values.put("carbon_gpu_reflection_faces", String.valueOf(p.getInt(KEY_REFLECTIONS, 0)));
         values.put("carbon_gpu_mirror_half_rate", bool(p.getBoolean(KEY_MIRROR_HALF, true)));
+        values.put("carbon_gpu_threaded_cp", bool(p.getBoolean(KEY_THREADED_CP, true)));
         // MSAA off by default: on Adreno the Xenos path is much faster at 1
         // sample. "native_2x_msaa" only gates the host's 2x attachment support.
         int msaaSamples = p.getInt(KEY_MSAA_SAMPLES, DEFAULT_MSAA_SAMPLES);

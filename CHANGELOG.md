@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased: threaded command processing
+
+- **Command fetch thread** (`carbon_gpu_threaded_cp`, Settings > Graphics > Threaded command processing,
+  default on). A new "GPU Fetch" thread does what the hardware command fetcher does: it frames the PM4
+  packets in the ring, expands indirect buffers, drops predicated-off packets, copies the rest into an
+  8 MiB private queue and publishes the ring read pointer straight away. "GPU Commands" then executes the
+  queued packets in order with the same code as before, so fences, interrupts, register state and
+  WAIT_REG_MEM behave exactly as in single-thread mode. The game no longer waits for ring space while
+  draws are being recorded. New log line every 5 s: peak queue use and how often fetch waited.
+  Not measured on the phone yet.
+
 ## 0.3.4 (2026-10-07): car reflections off
 
 - **Car reflections default to Off** (`carbon_gpu_reflection_faces = 0`, Settings > Graphics > Car reflections). The

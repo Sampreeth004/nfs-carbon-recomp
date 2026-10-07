@@ -4,11 +4,20 @@
 // contract the game's Direct3D relies on (read pointer write-back, interrupts,
 // scratch/fence writes, WAIT_REG_MEM) and hands draws, resolves and swaps to
 // the Renderer, which records them as Vulkan work.
+//
+// With carbon_gpu_threaded_cp (default on) a second thread ("GPU Fetch") does what
+// the hardware command fetcher does: it frames the packets in the ring (expanding
+// indirect buffers, dropping predicated-off packets), copies them into a private
+// queue and publishes the read pointer, so the game never waits for ring space
+// while draws are being recorded. "GPU Commands" then executes the queued packets
+// in order with the same code as before, so fences, interrupts and register
+// semantics are unchanged.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -79,6 +88,11 @@ class CommandProcessor {
 
  private:
   void WorkerMain();
+  // Threaded mode: FetchMain stages packets, ExecutorMain executes them.
+  void FetchMain();
+  void ExecutorMain();
+  uint32_t FetchPrimaryBuffer(uint32_t read_index, uint32_t write_index);
+  void FetchIndirectBuffer(uint32_t ptr, uint32_t count, uint32_t depth);
   uint32_t ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index);
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t count);
 
@@ -110,6 +124,10 @@ class CommandProcessor {
     }
   };
 
+  // Fetch side: frames one packet and stages it (see StagingWrite). Returns false on a
+  // malformed packet.
+  bool StagePacket(Reader& r, uint32_t depth);
+  bool StagingWrite(Reader& r, uint32_t total_dwords);
   bool ExecutePacket(Reader& r);
   bool ExecuteType3(Reader& r, uint32_t packet);
   void WriteRegister(uint32_t index, uint32_t value);
@@ -141,6 +159,23 @@ class CommandProcessor {
   uint64_t bin_select_ = ~uint64_t(0);
   std::atomic<uint32_t> counter_{0};
   std::atomic<uint32_t> swap_count_{0};
+
+  // ---- Threaded fetch/execute (carbon_gpu_threaded_cp) ----
+  static constexpr uint32_t kStagingDwords = uint32_t(1) << 21;  // 8 MiB
+  bool threaded_ = false;
+  std::unique_ptr<uint32_t[]> staging_;       // raw (big-endian) packet dwords
+  std::atomic<uint32_t> staging_head_{0};     // written by the fetch thread (monotonic)
+  std::atomic<uint32_t> staging_tail_{0};     // written by the executor (monotonic)
+  uint32_t fetch_head_ = 0;                   // fetch thread's copy of staging_head_
+  uint64_t fe_bin_mask_ = ~uint64_t(0);
+  uint64_t fe_bin_select_ = ~uint64_t(0);
+  std::unique_ptr<rex::thread::Event> exec_event_;
+  std::unique_ptr<rex::thread::Event> space_event_;
+  std::atomic<bool> fetch_waiting_{false};
+  std::atomic<bool> exec_sleeping_{false};
+  rex::system::object_ref<rex::system::XHostThread> fetch_worker_;
+  std::atomic<uint32_t> fetch_full_waits_{0};  // times the fetch thread waited for space
+  std::atomic<uint32_t> staged_max_{0};        // peak dwords in flight
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

@@ -331,6 +331,10 @@ public class SettingsActivity extends Activity {
                 GameConfig.KEY_FINE_PACING, true);
         switchRow("Show FPS counter", "Overlay at the top of the screen while playing.",
                 GameConfig.KEY_SHOW_FPS, true);
+        switchRow("Threaded command processing",
+                "Reads the game's GPU commands on a separate thread so the game never waits "
+                        + "for ring space. Turn off if you see glitches.",
+                GameConfig.KEY_THREADED_CP, true);
 
         // ---- Effects
         beginCard("Effects and quality", null);
