@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: threaded command processing
+## 0.3.5 (2026-10-07): threaded command processing
 
 - **Command fetch thread** (`carbon_gpu_threaded_cp`, Settings > Graphics > Threaded command processing,
   default on). A new "GPU Fetch" thread does what the hardware command fetcher does: it frames the PM4
