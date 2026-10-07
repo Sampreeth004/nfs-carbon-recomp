@@ -73,8 +73,9 @@ REXCVAR_DEFINE_INT32(carbon_gpu_fps_cap, 0, "CarbonGPU",
                      "Frame rate cap applied when the guest presents (0 = none)")
     .range(0, 240);
 REXCVAR_DEFINE_INT32(carbon_gpu_reflection_faces, 6, "CarbonGPU",
-                     "Car reflection cube faces redrawn per frame (6 = all, every frame)")
-    .range(1, 6);
+                     "Car reflection cube faces redrawn per frame (6 = all, every frame, 0 = none). "
+                     "The faces are not sampled by this renderer yet, so 0 loses nothing visible")
+    .range(0, 6);
 REXCVAR_DEFINE_BOOL(carbon_gpu_mirror_half_rate, false, "CarbonGPU",
                     "Redraw the rear-view mirror every other frame");
 REXCVAR_DEFINE_BOOL(carbon_gpu_bloom, true, "CarbonGPU",
@@ -1937,7 +1938,9 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
   if (pass.color[0] && pass.depth && !pass.color[1]) {
     const RenderTarget* c0 = pass.color[0];
     bool throttle = false;
-    if (c0->pitch == 280 && reflection_faces_ < 6) {
+    if (c0->pitch == 280 && reflection_faces_ == 0) {
+      throttle = true;
+    } else if (c0->pitch == 280 && reflection_faces_ < 6) {
       uint32_t face = cube_face_in_frame_ % 6;
       uint32_t first = uint32_t((frame_number_ * uint64_t(reflection_faces_)) % 6);
       throttle = (face + 6 - first) % 6 >= uint32_t(reflection_faces_);

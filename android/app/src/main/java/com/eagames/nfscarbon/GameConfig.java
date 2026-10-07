@@ -88,6 +88,12 @@ public final class GameConfig {
 
     public static void writeToml(Context context) {
         SharedPreferences p = prefs(context);
+        // One-time: car reflections are not visible in the native renderer, so older
+        // installs that stored a non-zero value move to Off (it can be changed again).
+        if (!p.getBoolean("reflections_off_migrated", false)) {
+            p.edit().putInt(KEY_REFLECTIONS, 0).putBoolean("reflections_off_migrated", true)
+                    .apply();
+        }
 
         int guestWidth = p.getInt(KEY_WIDTH, DEFAULT_WIDTH);
         int guestHeight = p.getInt(KEY_HEIGHT, DEFAULT_HEIGHT);
@@ -101,7 +107,7 @@ public final class GameConfig {
         values.put("achievement_toasts", "false");
         values.put("carbon_gpu_render_scale", String.valueOf(p.getInt(KEY_RENDER_SCALE, 100)));
         values.put("carbon_gpu_fps_cap", String.valueOf(p.getInt(KEY_FPS_CAP, 60)));
-        values.put("carbon_gpu_reflection_faces", String.valueOf(p.getInt(KEY_REFLECTIONS, 2)));
+        values.put("carbon_gpu_reflection_faces", String.valueOf(p.getInt(KEY_REFLECTIONS, 0)));
         values.put("carbon_gpu_mirror_half_rate", bool(p.getBoolean(KEY_MIRROR_HALF, true)));
         // MSAA off by default: on Adreno the Xenos path is much faster at 1
         // sample. "native_2x_msaa" only gates the host's 2x attachment support.

@@ -67,12 +67,12 @@ public class SettingsActivity extends Activity {
     // scale %, fps cap, bloom, reflection faces, mirror half rate, anisotropy value
     private static final String[] PRESET_NAMES = {"Battery saver", "Balanced", "Quality"};
     private static final String[] PRESET_HINTS = {
-            "30 fps, 75% resolution", "60 fps, recommended", "Bloom, full reflections"
+            "30 fps, 75% resolution", "60 fps, recommended", "Bloom, 16x filtering"
     };
     private static final int[][] PRESETS = {
-            {75, 30, 0, 1, 1, 0},
-            {100, 60, 0, 2, 1, 3},
-            {100, 60, 1, 6, 0, 5},
+            {75, 30, 0, 0, 1, 0},
+            {100, 60, 0, 0, 1, 3},
+            {100, 60, 1, 0, 0, 5},
     };
 
     private LinearLayout container;
@@ -337,13 +337,14 @@ public class SettingsActivity extends Activity {
         switchRow("Bloom / glow",
                 "Heavy: heats the phone and costs fps. Off by default on Android.",
                 GameConfig.KEY_BLOOM, false);
-        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 2);
+        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 0);
         intSpinnerAt("Car reflections",
-                "How many reflection faces are refreshed per frame.",
-                new String[]{"Full (6 faces per frame)", "Reduced (2 per frame)",
-                        "Minimal (1 per frame)"},
-                new int[]{6, 2, 1}, GameConfig.KEY_REFLECTIONS,
-                reflStored >= 6 ? 0 : (reflStored >= 2 ? 1 : 2));
+                "The native renderer does not show these yet, so Off costs nothing and saves "
+                        + "GPU work and heat. The other options only add work.",
+                new String[]{"Off (recommended)", "Full (6 faces per frame)",
+                        "Reduced (2 per frame)", "Minimal (1 per frame)"},
+                new int[]{0, 6, 2, 1}, GameConfig.KEY_REFLECTIONS,
+                reflStored <= 0 ? 0 : (reflStored >= 6 ? 1 : (reflStored >= 2 ? 2 : 3)));
         switchRow("Rear-view mirror at half rate", "Lighter; the mirror updates every other frame.",
                 GameConfig.KEY_MIRROR_HALF, true);
         intSpinner("Anisotropic filtering", "Sharper textures at angles.",
@@ -412,7 +413,7 @@ public class SettingsActivity extends Activity {
                 prefs.getInt(GameConfig.KEY_RENDER_SCALE, 100),
                 prefs.getInt(GameConfig.KEY_FPS_CAP, 60),
                 prefs.getBoolean(GameConfig.KEY_BLOOM, false) ? 1 : 0,
-                prefs.getInt(GameConfig.KEY_REFLECTIONS, 2),
+                prefs.getInt(GameConfig.KEY_REFLECTIONS, 0),
                 prefs.getBoolean(GameConfig.KEY_MIRROR_HALF, true) ? 1 : 0,
                 prefs.getInt(GameConfig.KEY_ANISO, 3),
         };

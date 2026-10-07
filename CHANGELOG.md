@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.4 (2026-10-07): car reflections off
+
+- **Car reflections default to Off** (`carbon_gpu_reflection_faces = 0`, Settings > Graphics > Car reflections). The
+  six cube-face passes and their resolves were measured as never sampled by any draw, so nothing visible
+  changes. The old default (2 faces per frame) still cost about 60 draws and 2.4 passes per frame:
+  on the phone, CPU draw recording 5.6 -> 4.7 ms per frame, GPU 7.25 -> 7.0 ms, GPU p99 15.5 -> 14.4 ms.
+  Existing installs are moved to Off once; the other options remain and only add work.
+
 ## 0.3.3 (2026-10-07): downloaded turnip drivers, new settings, redundant resolve skipping
 
 - **Redundant resolves are skipped** (`carbon_gpu_skip_redundant_resolves`, default on). Every render target
