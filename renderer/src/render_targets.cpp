@@ -204,6 +204,7 @@ RenderTarget* Renderer::GetRenderTarget(bool depth, uint32_t edram_base, uint32_
     }
     rt = created.get();
     rt->last_used_frame = frame_number_;
+    rt->write_gen = ++rt_write_counter_;
     if (!depth) {
       // Start black: passes that get skipped must resolve to nothing, not garbage.
       EndRendering();
@@ -539,62 +540,143 @@ void Renderer::Resolve(const RegisterFile& regs) {
     int32_t dx1 = std::min<int32_t>(int32_t(std::ceil(x1 * rs)), int32_t(dest->width));
     int32_t dy1 = std::min<int32_t>(int32_t(std::ceil(y1 * rs)) + dy, int32_t(dest->height));
     if (dx1 > dx0 && dy1 > dy0) {
-      VkImageAspectFlags src_aspect =
-          is_depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                   : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
-      TransitionImage(cb, src->image, src_aspect, src->layout,
-                      is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                               : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-      TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 1, 1);
-      VkImageView dest_view = GetTextureView(*dest, kSwizzleRgba, false, VK_IMAGE_VIEW_TYPE_2D);
-      VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-      att.imageView = dest_view;
-      att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-      att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-      ri.renderArea = {{0, 0}, {dest->width, dest->height}};
-      ri.layerCount = 1;
-      ri.colorAttachmentCount = 1;
-      ri.pColorAttachments = &att;
-      dfn.vkCmdBeginRendering(cb, &ri);
-      VkPipeline pipeline = GetResolvePipeline(dest->format.host_format, is_depth);
-      VkDescriptorSet set = AllocateDescriptorSet(resolve_set_layout_);
-      VkDescriptorImageInfo ii = {point_sampler_, src->sample_view,
-                                  is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-      VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      w.dstSet = set;
-      w.dstBinding = 0;
-      w.descriptorCount = 1;
-      w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-      w.pImageInfo = &ii;
-      dfn.vkUpdateDescriptorSets(vk_device_, 1, &w, 0, nullptr);
-      dfn.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-      dfn.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, resolve_pipeline_layout_,
-                                  0, 1, &set, 0, nullptr);
-      struct {
-        int32_t offset[2];
-        float scale;
-        uint32_t swap_rb;
-      } pc = {{0, -dy},
-              is_depth ? 1.0f : std::ldexp(1.0f, int(dest_info.copy_dest_exp_bias)),
-              (!is_depth && dest_info.copy_dest_swap) ? 1u : 0u};
-      dfn.vkCmdPushConstants(cb, resolve_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16,
-                             &pc);
-      VkViewport vp = {0.0f, 0.0f, float(dest->width), float(dest->height), 0.0f, 1.0f};
-      VkRect2D sc = {{dx0, dy0}, {uint32_t(dx1 - dx0), uint32_t(dy1 - dy0)}};
-      dfn.vkCmdSetViewport(cb, 0, 1, &vp);
-      dfn.vkCmdSetScissor(cb, 0, 1, &sc);
-      dfn.vkCmdDraw(cb, 3, 1, 0, 0);
-      dfn.vkCmdEndRendering(cb);
-      GpuStamp(kTagResolve);
-      TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
-                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, 1);
-      dest->resolved = true;
-      dest->resolved_swap_rb = !is_depth && dest_info.copy_dest_swap;
-      dest->last_used_frame = frame_number_;
+      // Redundant-resolve check. A resolve copies a fixed function of the source target's
+      // contents (identified by its write stamp), the rectangle, and the copy parameters.
+      // If the last resolve into an overlapping region of this destination had the same
+      // signature, the destination already holds exactly these texels. Every draw or clear
+      // that changes the source gets a new stamp, and any resolve into an overlapping
+      // region replaces the recorded signature, so stale data cannot be kept.
+      ResolveSig sig;
+      sig.src = src;
+      sig.src_gen = src->write_gen;
+      sig.x0 = dx0;
+      sig.y0 = dy0;
+      sig.x1 = dx1;
+      sig.y1 = dy1;
+      sig.dy = dy;
+      sig.exp_bias = is_depth ? 0 : int32_t(dest_info.copy_dest_exp_bias);
+      sig.swap_rb = (!is_depth && dest_info.copy_dest_swap) ? 1u : 0u;
+      sig.depth = is_depth ? 1u : 0u;
+      const uint64_t resolve_px = uint64_t(dx1 - dx0) * uint64_t(dy1 - dy0);
+      const uint64_t src_bpp = std::max<uint64_t>(
+          1, src->memory_bytes / std::max<uint64_t>(1, uint64_t(src->width) * src->height));
+      const uint64_t dest_bpp = std::max<uint64_t>(
+          1, dest->memory_bytes / std::max<uint64_t>(1, uint64_t(dest->width) * dest->height));
+      const uint64_t resolve_bytes = resolve_px * (src_bpp + dest_bpp);
+      bool redundant = false;
+      if (skip_redundant_resolves_) {
+        for (const ResolveSig& known : dest->resolve_sigs) {
+          if (known == sig) {
+            redundant = true;
+            break;
+          }
+        }
+      }
+      if (redundant) {
+        ++stats_.resolves_skipped;
+        stats_.resolve_px_skipped += resolve_px;
+        stats_.resolve_bytes_skipped += resolve_bytes;
+        dest->resolved = true;
+        dest->resolved_swap_rb = sig.swap_rb != 0;
+        dest->last_used_frame = frame_number_;
+        if (tracing_) {
+          REXGPU_WARN("[carbon-gpu] trace: resolve skipped as redundant (src stamp {})",
+                      sig.src_gen);
+        }
+      } else {
+        VkImageAspectFlags src_aspect =
+            is_depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                     : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+        TransitionImage(cb, src->image, src_aspect, src->layout,
+                        is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 1, 1);
+        VkImageView dest_view = GetTextureView(*dest, kSwizzleRgba, false, VK_IMAGE_VIEW_TYPE_2D);
+        VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        att.imageView = dest_view;
+        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {dest->width, dest->height}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        dfn.vkCmdBeginRendering(cb, &ri);
+        VkPipeline pipeline = GetResolvePipeline(dest->format.host_format, is_depth);
+        VkDescriptorSet set = AllocateDescriptorSet(resolve_set_layout_);
+        VkDescriptorImageInfo ii = {point_sampler_, src->sample_view,
+                                    is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = set;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &ii;
+        dfn.vkUpdateDescriptorSets(vk_device_, 1, &w, 0, nullptr);
+        dfn.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        dfn.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, resolve_pipeline_layout_,
+                                    0, 1, &set, 0, nullptr);
+        struct {
+          int32_t offset[2];
+          float scale;
+          uint32_t swap_rb;
+        } pc = {{0, -dy},
+                is_depth ? 1.0f : std::ldexp(1.0f, int(dest_info.copy_dest_exp_bias)),
+                (!is_depth && dest_info.copy_dest_swap) ? 1u : 0u};
+        dfn.vkCmdPushConstants(cb, resolve_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16,
+                               &pc);
+        VkViewport vp = {0.0f, 0.0f, float(dest->width), float(dest->height), 0.0f, 1.0f};
+        VkRect2D sc = {{dx0, dy0}, {uint32_t(dx1 - dx0), uint32_t(dy1 - dy0)}};
+        dfn.vkCmdSetViewport(cb, 0, 1, &vp);
+        dfn.vkCmdSetScissor(cb, 0, 1, &sc);
+        dfn.vkCmdDraw(cb, 3, 1, 0, 0);
+        dfn.vkCmdEndRendering(cb);
+        GpuStamp(kTagResolve);
+        TransitionImage(cb, dest->image, VK_IMAGE_ASPECT_COLOR_BIT, dest->layout,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, 1);
+        dest->resolved = true;
+        dest->resolved_swap_rb = !is_depth && dest_info.copy_dest_swap;
+        dest->last_used_frame = frame_number_;
+        // The copy replaced this region: forget any older signature that overlaps it.
+        uint32_t dead_here = 0;
+        auto& sigs = dest->resolve_sigs;
+        sigs.erase(std::remove_if(sigs.begin(), sigs.end(),
+                                  [&](const ResolveSig& k) {
+                                    if (!k.Overlaps(sig)) return false;
+                                    if (!k.sampled) {
+                                      uint64_t px = uint64_t(k.x1 - k.x0) * uint64_t(k.y1 - k.y0);
+                                      ++stats_.resolves_dead;
+                                      ++dead_here;
+                                      stats_.resolve_px_dead += px;
+                                      stats_.resolve_bytes_dead += px * (src_bpp + dest_bpp);
+                                    }
+                                    return true;
+                                  }),
+                   sigs.end());
+        dest->has_unsampled = true;
+        sigs.push_back(sig);
+        if (sigs.size() > 8) sigs.erase(sigs.begin());
+        ++stats_.resolves_copied;
+        {
+          uint64_t key = (uint64_t(dest->guest.base_address) << 8) ^ (uint64_t(dest->width) << 40) ^
+                         (uint64_t(dy0) << 24) ^ uint64_t(src->pitch) ^ (uint64_t(is_depth) << 3);
+          DestAgg& d = dest_agg_[key];
+          d.base = dest->guest.base_address;
+          d.w = dx1 - dx0;
+          d.h = dy1 - dy0;
+          d.fmt = uint32_t(dest->guest.format);
+          d.src_pitch = src->pitch;
+          d.src_fmt = is_depth ? 99 : src->guest_format;
+          ++d.resolves;
+          d.px += resolve_px;
+          d.dead += dead_here;
+        }
+        stats_.resolve_px_copied += resolve_px;
+        stats_.resolve_bytes_copied += resolve_bytes;
+      }
     }
   }
 
@@ -617,6 +699,7 @@ void Renderer::Resolve(const RegisterFile& regs) {
     if (cx1 > cx0 && cy1 > cy0) {
       VkClearRect rect = {{{cx0, cy0}, {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0)}}, 0, 1};
       dfn.vkCmdClearAttachments(frame().cb, 1, &clear, 1, &rect);
+      rt->write_gen = ++rt_write_counter_;
     }
     EndRendering();
   };

@@ -10,8 +10,6 @@
 
 #include "android_aaudio.h"
 
-#include <rex/cvar.h>
-
 // Defined in librexruntime.so (rex/input/touchpad/touchpad_input_driver.cpp).
 extern "C" {
 void rex_input_set_touch_pad(uint16_t buttons, float lstick_x, float lstick_y, float rstick_x,
@@ -85,16 +83,3 @@ extern "C" JNIEXPORT void JNICALL Java_com_eagames_nfscarbon_GameBridge_nativeSe
   carbon::audio::SetOutputPaused(paused != JNI_FALSE);
 }
 
-// Generic cvar setter called from Java (e.g. by the thermal auto-downgrade
-// logic in GameActivity) so any renderer setting can be changed at runtime
-// without requiring a native change per cvar.
-extern "C" JNIEXPORT void JNICALL Java_com_eagames_nfscarbon_GameBridge_nativeSetCvar(
-    JNIEnv* env, jclass, jstring name, jstring value) {
-  const char* n = env->GetStringUTFChars(name, nullptr);
-  const char* v = value ? env->GetStringUTFChars(value, nullptr) : nullptr;
-  if (n && v) {
-    rex::cvar::SetFlagByName(n, v);
-  }
-  env->ReleaseStringUTFChars(name, n);
-  if (value && v) env->ReleaseStringUTFChars(value, v);
-}

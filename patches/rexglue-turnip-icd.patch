@@ -1,0 +1,104 @@
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -32,6 +32,8 @@
+ 
+   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+   void Close();
++  // Takes ownership of an already opened native handle (dlopen / HMODULE).
++  void Adopt(void* handle);
+   explicit operator bool() const { return handle_ != nullptr; }
+ 
+   void* GetRawSymbol(const char* name) const;
+--- a/src/core/dynlib_posix.cpp
++++ b/src/core/dynlib_posix.cpp
+@@ -38,6 +38,11 @@
+   }
+ }
+ 
++void DynamicLibrary::Adopt(void* handle) {
++  Close();
++  handle_ = handle;
++}
++
+ void* DynamicLibrary::GetRawSymbol(const char* name) const {
+   if (!handle_)
+     return nullptr;
+--- a/src/core/dynlib_win.cpp
++++ b/src/core/dynlib_win.cpp
+@@ -38,6 +38,11 @@
+   }
+ }
+ 
++void DynamicLibrary::Adopt(void* handle) {
++  Close();
++  handle_ = handle;
++}
++
+ void* DynamicLibrary::GetRawSymbol(const char* name) const {
+   if (!handle_)
+     return nullptr;
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <sstream>
+ #include <string>
+ #include <unordered_map>
+@@ -32,6 +33,22 @@
+                       "build). Empty uses the system loader")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(vulkan_icd_driver, "", "UI/Vulkan",
++                      "Path to a custom Vulkan driver (ICD, for example a downloaded turnip "
++                      "build). It is opened by the application's registered hook, not as a loader")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace {
++std::atomic<void* (*)(const char*)> g_icd_driver_hook{nullptr};
++}  // namespace
++
++// The application registers a function that opens the system Vulkan loader with
++// the given ICD driver injected, and returns the dlopen-style handle (or null).
++extern "C" __attribute__((visibility("default"))) void rex_ui_set_vulkan_icd_hook(
++    void* (*hook)(const char* driver_path)) {
++  g_icd_driver_hook.store(hook);
++}
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -83,7 +100,30 @@
+   // A user-provided loader wins when set (Android launcher: imported driver).
+   // dlopen of absolute paths under the app's own files directory works; paths
+   // outside it may be rejected by the platform.
+-  const std::string custom_loader = REXCVAR_GET(vulkan_loader);
++  const std::string icd_driver = REXCVAR_GET(vulkan_icd_driver);
++  if (!icd_driver.empty()) {
++    if (auto hook = g_icd_driver_hook.load()) {
++      if (void* handle = hook(icd_driver.c_str())) {
++        vulkan_instance->loader_.Adopt(handle);
++        if (vulkan_instance->loader_.GetSymbol<PFN_vkGetInstanceProcAddr>(
++                "vkGetInstanceProcAddr")) {
++          loader_loaded = true;
++          REXLOG_INFO("Loaded Vulkan through custom ICD driver {}", icd_driver);
++        } else {
++          REXLOG_WARN("Custom ICD driver {} returned a loader without vkGetInstanceProcAddr",
++                      icd_driver);
++          vulkan_instance->loader_.Adopt(nullptr);
++        }
++      } else {
++        REXLOG_WARN("Could not open custom ICD driver {}; falling back to the system driver",
++                    icd_driver);
++      }
++    } else {
++      REXLOG_WARN("Custom ICD driver {} set but this build has no ICD hook; using system driver",
++                  icd_driver);
++    }
++  }
++  const std::string custom_loader = loader_loaded ? std::string() : REXCVAR_GET(vulkan_loader);
+   if (!custom_loader.empty()) {
+     if (vulkan_instance->loader_.Load(custom_loader)) {
+       // Accept the library only if it really is a Vulkan loader. HAL/ICD-only

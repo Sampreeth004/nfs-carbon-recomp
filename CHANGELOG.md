@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.3 (2026-10-07): downloaded turnip drivers, new settings, redundant resolve skipping
+
+- **Redundant resolves are skipped** (`carbon_gpu_skip_redundant_resolves`, default on). Every render target
+  carries a write stamp that changes on each recorded draw, each clear and at creation; each resolved
+  texture remembers what its last resolves copied (source target, stamp, rectangle, exp bias, swap).
+  A resolve with an identical signature into a region nothing has overwritten since copies the same
+  texels, so it is skipped; any resolve into an overlapping region replaces the old signature. Barriers
+  and layouts are untouched because skipped resolves record no commands.
+  On the phone (Adreno 830, turnip, driving) this removes about 1.2-2 of ~19 resolves per frame (about
+  5% of resolve pixels and bandwidth). Resolves cost only about 1.1 ms of ~7.5 ms GPU per frame, so the
+  effect on frame time is below run-to-run noise.
+- New stats lines (`carbon_gpu_stats`): frame and GPU time p50/p95/p99, resolves copied/skipped per frame,
+  resolved pixels and bandwidth, and resolves that were overwritten before anything sampled them, with
+  the top destinations.
+- Finding: about 23% of resolve pixels (7 of ~18 resolves per frame) are overwritten before any draw
+  samples them: the scene and bloom targets (1-2 of 3 per frame each) and all car-reflection cube faces
+  (256x256, never sampled because cube fetches do not read resolved faces). They cannot be dropped
+  soundly without knowing the future of the command stream, so they are still copied.
+
+- **Turnip / Adreno driver packages now work.** Zips downloaded from the internet (a `meta.json`
+  plus `libvulkan_freedreno.so`) used to be rejected because they are ICD drivers, not a full
+  `libvulkan.so`. They are now opened through
+  [libadrenotools](https://github.com/bylaws/libadrenotools) (BSD-2-Clause, Billy Laws; vendored in
+  `third_party/libadrenotools`), which loads the driver beside the system Vulkan loader. Adreno GPUs on
+  arm64 phones only; if the driver cannot be opened the game uses the system driver. Packages whose
+  files sit inside a single folder are found too. Full `libvulkan.so` loaders still work as before.
+- **Thermal auto-downgrade removed** (added in 0.3.2): the app no longer polls the thermal headroom or
+  lowers the fps cap on its own, and the generic `GameBridge.setCvar` JNI setter it needed is gone. The
+  frame rate cap is whatever you set in Settings. The ADPF performance hint and the per-frame
+  re-read of the cap stay.
+- **Settings redesign**: header with a Back button and category tabs (Graphics, GPU driver, Game data,
+  Controls, About) over dark glass cards in the launcher's style, instead of one long plain list.
+  Graphics gains one-tap presets (Battery saver, Balanced, Quality) and groups options into Display,
+  Effects and quality, and Xenos-only cards, each with a short explanation; toggles are switches. The
+  GPU driver page shows the active driver and its status, lists drivers as tappable rows with
+  per-driver Remove, and has a single Import button. Settings values and storage are unchanged.
+- SDK patch `patches/rexglue-turnip-icd.patch` (`DynamicLibrary::Adopt`, `vulkan_icd_driver` cvar, ICD
+  hook). The APK must ship `libmain_hook.so`, `libhook_impl.so`, `libfile_redirect_hook.so` and
+  `libgsl_alloc_hook.so` in `jniLibs/arm64-v8a` (built by the `nfscarbon` target).
+
 ## 0.3.2 (2026-10-06): ADPF performance hint and thermal auto-downgrade
 
 - **ADPF performance hint** (Android 13+ devices): the rendering thread reports

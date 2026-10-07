@@ -73,6 +73,10 @@ struct RenderTarget {
   uint32_t pitch = 0;       // pixels
   uint32_t guest_format = 0;
   bool is_depth = false;
+  // Unique stamp (from Renderer::rt_write_counter_) of the last change to the
+  // contents: a recorded draw, a clear, or creation. Stamps are never reused, so
+  // a recreated target at the same address cannot match an older resolve.
+  uint64_t write_gen = 0;
   // Host image.
   VkImage image = VK_NULL_HANDLE;
   VmaAllocation allocation = VK_NULL_HANDLE;
@@ -87,6 +91,27 @@ struct RenderTarget {
   // Rows the game actually resolves from this target. Passes only cover these,
   // so oversized targets do not cost a full load and store per pass.
   uint32_t used_rows = 0;
+};
+
+// What a resolve copied into a region of a resolved texture. A later resolve with
+// an identical signature copies exactly the same texels, so it can be skipped.
+struct ResolveSig {
+  const RenderTarget* src = nullptr;
+  uint64_t src_gen = 0;
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // destination rectangle, host pixels
+  int32_t dy = 0;
+  int32_t exp_bias = 0;
+  uint32_t swap_rb = 0;
+  uint32_t depth = 0;
+  bool sampled = false;  // Read by a draw or the present since this resolve (diagnostic).
+  bool operator==(const ResolveSig& o) const {
+    return src == o.src && src_gen == o.src_gen && x0 == o.x0 && y0 == o.y0 && x1 == o.x1 &&
+           y1 == o.y1 && dy == o.dy && exp_bias == o.exp_bias && swap_rb == o.swap_rb &&
+           depth == o.depth;
+  }
+  bool Overlaps(const ResolveSig& o) const {
+    return x0 < o.x1 && o.x0 < x1 && y0 < o.y1 && o.y0 < y1;
+  }
 };
 
 // A host image that holds guest texture data (decoded from memory, or the
@@ -107,6 +132,10 @@ struct Texture {
   uint64_t last_hash_frame = 0;
   uint32_t hash_interval = 1;
   bool resolved = false;            // Contents come from GPU resolves.
+  // Regions of a resolved texture whose current contents are known (most recent
+  // last). Any resolve into an overlapping region replaces the entry.
+  std::vector<ResolveSig> resolve_sigs;
+  bool has_unsampled = false;
   float res_scale = 1.0f;           // host pixels per guest pixel (render scale)
   bool resolved_swap_rb = false;    // Last resolve swapped red/blue (copy_dest_swap).
   uint64_t resolved_memory_hash = 0;  // Guest memory hash when last resolved.
@@ -495,6 +524,14 @@ class Renderer {
   };
   struct Stats {
     uint32_t draws = 0, draws_skipped = 0, resolves = 0, passes = 0, pipelines_created = 0;
+    // Resolves that copied texels, and redundant ones skipped (same source contents,
+    // same rectangle and parameters, destination region untouched since).
+    uint32_t resolves_copied = 0, resolves_skipped = 0;
+    uint64_t resolve_px_copied = 0, resolve_px_skipped = 0;
+    uint64_t resolve_bytes_copied = 0, resolve_bytes_skipped = 0;  // source read + dest write
+    // Copied resolves whose result was overwritten before anything sampled it.
+    uint32_t resolves_dead = 0;
+    uint64_t resolve_px_dead = 0, resolve_bytes_dead = 0;
     uint32_t textures_uploaded = 0, shaders_compiled = 0;
     uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
     uint32_t evicted = 0, throttled = 0;
@@ -518,6 +555,18 @@ class Renderer {
   // Frame pacing for the Android fps overlay (rex_gpu_report_fps), every 0.5 s.
   double overlay_start_ = 0.0, overlay_last_swap_ = 0.0, overlay_worst_ms_ = 0.0;
   uint32_t overlay_frames_ = 0;
+  uint64_t rt_write_counter_ = 0;
+  // Per destination (guest address, size, format, source pitch): resolves and how many were
+  // overwritten before being sampled, for the stats window.
+  struct DestAgg {
+    uint32_t base = 0, w = 0, h = 0, fmt = 0, src_pitch = 0, src_fmt = 0;
+    uint32_t resolves = 0, dead = 0;
+    uint64_t px = 0;
+  };
+  std::unordered_map<uint64_t, DestAgg> dest_agg_;
+  bool skip_redundant_resolves_ = true;
+  // Frame and GPU times of the current stats window, for percentiles.
+  std::vector<float> frame_ms_hist_, gpu_ms_hist_;
 };
 
 }  // namespace carbon::gpu

@@ -58,7 +58,7 @@ public final class DriverStore {
             }
             File loader = findLoader(dir);
             if (loader != null) {
-                String label = metaName(dir);
+                String label = metaName(loader.getParentFile());
                 if (label == null || label.isEmpty()) {
                     label = dir.getName();
                 }
@@ -70,6 +70,26 @@ public final class DriverStore {
     }
 
     public static File findLoader(File dir) {
+        File found = findLoaderIn(dir);
+        if (found != null) {
+            return found;
+        }
+        // Some packages wrap their files in a single folder.
+        File[] children = dir.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                if (child.isDirectory() && !child.getName().equals("tmp")) {
+                    found = findLoaderIn(child);
+                    if (found != null) {
+                        return found;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static File findLoaderIn(File dir) {
         File preferred = new File(dir, "libvulkan.so");
         if (preferred.isFile()) {
             return preferred;
@@ -117,7 +137,7 @@ public final class DriverStore {
             StorageUtil.deleteRecursive(destination);
             return null;
         }
-        String label = metaName(destination);
+        String label = metaName(loader.getParentFile());
         if (label == null || label.isEmpty()) {
             label = destination.getName();
         }
@@ -243,11 +263,11 @@ public final class DriverStore {
     }
 
     /**
-     * A library can back VulkanInstance only when it is a full loader and
-     * exports vkGetInstanceProcAddr. Android turnip/Winlator packages are HAL
-     * or ICD modules (vk_icd*, HMI) and are rejected by the runtime.
+     * True when the library is a full Vulkan loader (exports vkGetInstanceProcAddr)
+     * and can be dlopen'ed directly. Turnip/Adreno packages are ICD modules instead;
+     * those are opened through libadrenotools (arm64 only).
      */
-    private static boolean exportsVulkanLoaderEntryPoint(File library) {
+    public static boolean exportsVulkanLoaderEntryPoint(File library) {
         RandomAccessFile file = null;
         try {
             file = new RandomAccessFile(library, "r");

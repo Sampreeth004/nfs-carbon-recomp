@@ -6,21 +6,29 @@ import android.app.ProgressDialog;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.Switch;
@@ -35,8 +43,10 @@ import java.util.Locale;
 public class SettingsActivity extends Activity {
     private static final int COLOR_TEXT = 0xFFE6EDF3;
     private static final int COLOR_MUTED = 0xFF8B949E;
-    private static final int COLOR_ACCENT = 0xFF58A6FF;
-    private static final int COLOR_BUTTON = 0xFF1F6FEB;
+    private static final int COLOR_ACCENT = 0xFF19C6E6;
+    private static final int COLOR_OK = 0xFF2ED47A;
+    private static final int COLOR_WARN = 0xFFFFB020;
+    private static final int COLOR_FIELD = 0xFF182233;
 
     private static final String[] ACTION_NAMES = {
             "None", "A", "B", "X", "Y", "LB", "RB", "LT (analog)", "RT (analog)",
@@ -49,13 +59,32 @@ public class SettingsActivity extends Activity {
             "", "", "", "", "", "", "", "lt", "rt", "", "", "", "", ""
     };
 
+    private static final String[] PAGES = {
+            "Graphics", "GPU driver", "Game data", "Controls", "About"
+    };
+    private static final int PAGE_CONTROLS = 3;
+
+    // scale %, fps cap, bloom, reflection faces, mirror half rate, anisotropy value
+    private static final String[] PRESET_NAMES = {"Battery saver", "Balanced", "Quality"};
+    private static final String[] PRESET_HINTS = {
+            "30 fps, 75% resolution", "60 fps, recommended", "Bloom, full reflections"
+    };
+    private static final int[][] PRESETS = {
+            {75, 30, 0, 1, 1, 0},
+            {100, 60, 0, 2, 1, 3},
+            {100, 60, 1, 6, 0, 5},
+    };
+
     private LinearLayout container;
+    private LinearLayout current;
+    private LinearLayout tabs;
+    private ScrollView scroll;
     private SharedPreferences prefs;
     private TouchLayout touchLayout;
+    private int page = 0;
+    private int rowsInCard = 0;
 
     private TextView isoValue;
-    private LinearLayout driverContainer;
-    private TextView driverWarning;
     private boolean pendingIsoScan = false;
     private Uri pendingIsoUri;
     private Uri pendingDriverUri;
@@ -65,14 +94,35 @@ public class SettingsActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_settings);
         container = findViewById(R.id.settings_container);
+        tabs = findViewById(R.id.settings_tabs);
+        scroll = findViewById(R.id.settings_scroll);
         prefs = GameConfig.prefs(this);
         touchLayout = TouchLayout.load(this);
-        buildGraphics();
-        buildGameData();
-        buildDriver();
-        buildTouch();
-        buildAbout();
-        if (getIntent().getBooleanExtra(LauncherActivity.EXTRA_OPEN_CONTROLS, false)) {
+
+        findViewById(R.id.settings_back).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                finish();
+            }
+        });
+
+        // Keep the cards a readable width on wide landscape screens.
+        int widthPx = getResources().getDisplayMetrics().widthPixels;
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) container.getLayoutParams();
+        lp.width = Math.min(widthPx, dp(780));
+        lp.gravity = Gravity.CENTER_HORIZONTAL;
+        container.setLayoutParams(lp);
+
+        boolean openControls = getIntent().getBooleanExtra(LauncherActivity.EXTRA_OPEN_CONTROLS,
+                false);
+        if (openControls) {
+            page = PAGE_CONTROLS;
+        } else if (savedInstanceState != null) {
+            page = savedInstanceState.getInt("page", 0);
+        }
+        buildTabs();
+        showPage(page);
+        if (openControls) {
             container.post(new Runnable() {
                 @Override
                 public void run() {
@@ -83,37 +133,116 @@ public class SettingsActivity extends Activity {
     }
 
     @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putInt("page", page);
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         touchLayout.save(this);
         GameConfig.writeToml(this);
     }
 
+    // -------------------------------------------------------------------- Pages
+
+    private void buildTabs() {
+        tabs.removeAllViews();
+        for (int i = 0; i < PAGES.length; i++) {
+            final int index = i;
+            TextView chip = new TextView(this);
+            chip.setText(PAGES[i]);
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+            chip.setGravity(Gravity.CENTER);
+            chip.setPadding(dp(18), dp(8), dp(18), dp(8));
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    showPage(index);
+                }
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            params.rightMargin = dp(8);
+            tabs.addView(chip, params);
+        }
+    }
+
+    private void updateTabs() {
+        for (int i = 0; i < tabs.getChildCount(); i++) {
+            TextView chip = (TextView) tabs.getChildAt(i);
+            boolean selected = i == page;
+            chip.setTextColor(selected ? Color.WHITE : COLOR_MUTED);
+            chip.setTypeface(null, selected ? Typeface.BOLD : Typeface.NORMAL);
+            if (selected) {
+                GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                        new int[]{0xFF12B5DB, 0xFF6A3DFF});
+                bg.setCornerRadius(dp(20));
+                chip.setBackground(bg);
+            } else {
+                chip.setBackground(rounded(0x33182233, 0x22FFFFFF, 20));
+            }
+        }
+    }
+
+    private void showPage(int index) {
+        page = index;
+        updateTabs();
+        populatePage();
+        scroll.scrollTo(0, 0);
+    }
+
+    private void populatePage() {
+        container.removeAllViews();
+        current = container;
+        rowsInCard = 0;
+        switch (page) {
+            case 0:
+                buildGraphics();
+                break;
+            case 1:
+                buildDriver();
+                break;
+            case 2:
+                buildGameData();
+                break;
+            case PAGE_CONTROLS:
+                buildTouch();
+                break;
+            default:
+                buildAbout();
+                break;
+        }
+    }
+
+    private void rebuildUi() {
+        final int y = scroll.getScrollY();
+        populatePage();
+        scroll.post(new Runnable() {
+            @Override
+            public void run() {
+                scroll.scrollTo(0, y);
+            }
+        });
+    }
+
     // ---------------------------------------------------------------- Graphics
 
     private void buildGraphics() {
-        section(R.string.graphics);
+        buildPresets();
 
+        // ---- Display
+        beginCard("Display", null);
         final String[] rendererLabels = {
                 "Native Vulkan (default)", "Xenos emulation (fallback)"
         };
         final String[] rendererValues = {"carbon", "xenos"};
-        String renderer = prefs.getString(GameConfig.KEY_RENDERER, GameConfig.DEFAULT_RENDERER);
-        spinnerRow("Renderer", rendererLabels, "xenos".equals(renderer) ? 1 : 0,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putString(GameConfig.KEY_RENDERER,
-                                rendererValues[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-        label("MSAA, single pass, occlusion and post-effect options apply to Xenos emulation "
-                + "only.");
+        stringSpinner("Renderer",
+                "Native Vulkan is much faster. Xenos emulation is a slower compatibility "
+                        + "fallback.",
+                rendererLabels, rendererValues, GameConfig.KEY_RENDERER,
+                GameConfig.DEFAULT_RENDERER);
 
         int width = prefs.getInt(GameConfig.KEY_WIDTH, GameConfig.DEFAULT_WIDTH);
         int height = prefs.getInt(GameConfig.KEY_HEIGHT, GameConfig.DEFAULT_HEIGHT);
@@ -143,7 +272,10 @@ public class SettingsActivity extends Activity {
         customWidth.setVisibility(selection == 4 ? View.VISIBLE : View.GONE);
         customHeight.setVisibility(selection == 4 ? View.VISIBLE : View.GONE);
 
-        spinnerRow("Guest resolution", labels, selection,
+        spinnerRow("Guest resolution",
+                "Resolution the game thinks it renders at. Leave at 720p-class values unless "
+                        + "you know you need more.",
+                labels, selection,
                 new AdapterView.OnItemSelectedListener() {
                     @Override
                     public void onItemSelected(AdapterView<?> parent, View view, int position,
@@ -166,34 +298,16 @@ public class SettingsActivity extends Activity {
                     public void onNothingSelected(AdapterView<?> parent) {
                     }
                 });
-
-        container.addView(customWidth, matchWrap());
-        container.addView(customHeight, matchWrap());
-
-        customWidth.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-            }
-
-            @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-            }
-
+        addField(customWidth);
+        addField(customHeight);
+        customWidth.addTextChangedListener(new SimpleWatcher() {
             @Override
             public void afterTextChanged(Editable s) {
                 int value = parseInt(s.toString(), GameConfig.DEFAULT_WIDTH, 640, 4095);
                 prefs.edit().putInt(GameConfig.KEY_WIDTH, value).apply();
             }
         });
-        customHeight.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-            }
-
-            @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-            }
-
+        customHeight.addTextChangedListener(new SimpleWatcher() {
             @Override
             public void afterTextChanged(Editable s) {
                 int value = parseInt(s.toString(), GameConfig.DEFAULT_HEIGHT, 480, 4095);
@@ -201,154 +315,146 @@ public class SettingsActivity extends Activity {
             }
         });
 
-        switchRow("Vertical sync", GameConfig.KEY_VSYNC, true);
-        switchRow("Bloom / glow (heavy: heats the phone, costs fps)", GameConfig.KEY_BLOOM, false);
-        final String[] scaleLabels = {"100% (1280x720, sharpest)", "85% (1088x612)",
-                "75% (960x540, lighter)", "60% (768x432)", "50% (640x360, lightest)"};
-        final int[] scaleValues = {100, 85, 75, 60, 50};
-        int scaleStored = prefs.getInt(GameConfig.KEY_RENDER_SCALE, 100);
-        int scaleSelection = 0;
-        for (int i = 0; i < scaleValues.length; i++) {
-            if (scaleValues[i] == scaleStored) {
-                scaleSelection = i;
-            }
-        }
-        spinnerRow("Render resolution", scaleLabels, scaleSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putInt(GameConfig.KEY_RENDER_SCALE, scaleValues[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-        final String[] capLabels = {"30 fps (coolest, steadiest)", "45 fps", "60 fps", "Unlimited"};
-        final int[] capValues = {30, 45, 60, 0};
-        int capSelection = 2;
-        int storedCap = prefs.getInt(GameConfig.KEY_FPS_CAP, 60);
-        for (int i = 0; i < capValues.length; i++) {
-            if (capValues[i] == storedCap) {
-                capSelection = i;
-            }
-        }
-        spinnerRow("Frame rate cap", capLabels, capSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putInt(GameConfig.KEY_FPS_CAP, capValues[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-        final String[] reflLabels = {"Car reflections: full (6 faces per frame)",
-                "Car reflections: reduced (2 per frame)", "Car reflections: minimal (1 per frame)"};
-        final int[] reflValues = {6, 2, 1};
-        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 2);
-        int reflSelection = reflStored >= 6 ? 0 : (reflStored >= 2 ? 1 : 2);
-        spinnerRow("Car reflections", reflLabels, reflSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putInt(GameConfig.KEY_REFLECTIONS, reflValues[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-        switchRow("Rear-view mirror at half rate (lighter)", GameConfig.KEY_MIRROR_HALF, true);
-        switchRow("Letterbox presentation", GameConfig.KEY_LETTERBOX, true);
-        switchRow("Occlusion queries (sun flares, lights)", GameConfig.KEY_OCCLUSION, true);
-        switchRow("Single-pass scene (faster; requires MSAA off)",
-                GameConfig.KEY_SINGLE_PASS, true);
-        switchRow("Fine frame pacing (120 Hz timing, 60 fps cap)",
+        intSpinner("Render resolution",
+                "Scales the native renderer's targets. Lower is cooler and faster.",
+                new String[]{"100% (1280x720, sharpest)", "85% (1088x612)",
+                        "75% (960x540, lighter)", "60% (768x432)", "50% (640x360, lightest)"},
+                new int[]{100, 85, 75, 60, 50}, GameConfig.KEY_RENDER_SCALE, 100);
+        intSpinner("Frame rate cap",
+                "Lower caps run cooler. The game is designed for 30 or 60.",
+                new String[]{"30 fps (coolest, steadiest)", "45 fps", "60 fps", "Unlimited"},
+                new int[]{30, 45, 60, 0}, GameConfig.KEY_FPS_CAP, 60);
+        switchRow("Vertical sync", null, GameConfig.KEY_VSYNC, true);
+        switchRow("Letterbox presentation", "Keep the game's aspect ratio with black bars.",
+                GameConfig.KEY_LETTERBOX, true);
+        switchRow("Fine frame pacing", "120 Hz timing with a 60 fps cap for smoother frames.",
                 GameConfig.KEY_FINE_PACING, true);
-        switchRow("Show FPS counter on screen", GameConfig.KEY_SHOW_FPS, true);
+        switchRow("Show FPS counter", "Overlay at the top of the screen while playing.",
+                GameConfig.KEY_SHOW_FPS, true);
 
-        final int[] anisoValues = {3, 0, 2, 5, -1};
-        final String[] anisoLabels = {
-                "Force 4x (default)", "Off (fastest)", "2x", "16x", "No override"
-        };
-        int aniso = prefs.getInt(GameConfig.KEY_ANISO, 3);
-        int anisoSelection = 0;
-        for (int i = 0; i < anisoValues.length; i++) {
-            if (anisoValues[i] == aniso) {
-                anisoSelection = i;
-            }
-        }
-        spinnerRow("Anisotropic filtering", anisoLabels, anisoSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putInt(GameConfig.KEY_ANISO, anisoValues[position]).apply();
-                    }
+        // ---- Effects
+        beginCard("Effects and quality", null);
+        switchRow("Bloom / glow",
+                "Heavy: heats the phone and costs fps. Off by default on Android.",
+                GameConfig.KEY_BLOOM, false);
+        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 2);
+        intSpinnerAt("Car reflections",
+                "How many reflection faces are refreshed per frame.",
+                new String[]{"Full (6 faces per frame)", "Reduced (2 per frame)",
+                        "Minimal (1 per frame)"},
+                new int[]{6, 2, 1}, GameConfig.KEY_REFLECTIONS,
+                reflStored >= 6 ? 0 : (reflStored >= 2 ? 1 : 2));
+        switchRow("Rear-view mirror at half rate", "Lighter; the mirror updates every other frame.",
+                GameConfig.KEY_MIRROR_HALF, true);
+        intSpinner("Anisotropic filtering", "Sharper textures at angles.",
+                new String[]{"Force 4x (default)", "Off (fastest)", "2x", "16x", "No override"},
+                new int[]{3, 0, 2, 5, -1}, GameConfig.KEY_ANISO, 3);
 
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-
-        final int[] msaaValues = {0, 2, 4};
-        final String[] msaaLabels = {"Off (fastest)", "MSAA 2x", "MSAA 4x (game default)"};
+        // ---- Xenos only
+        beginCard("Xenos emulation only",
+                "These options only apply when the renderer is set to Xenos emulation.");
         int msaa = prefs.getInt(GameConfig.KEY_MSAA_SAMPLES, GameConfig.DEFAULT_MSAA_SAMPLES);
-        int msaaSelection = msaa >= 4 ? 2 : (msaa >= 2 ? 1 : 0);
-        spinnerRow("Anti-aliasing (MSAA)", msaaLabels, msaaSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit()
-                                .putInt(GameConfig.KEY_MSAA_SAMPLES, msaaValues[position])
-                                .apply();
-                    }
+        intSpinnerAt("Anti-aliasing (MSAA)", null,
+                new String[]{"Off (fastest)", "MSAA 2x", "MSAA 4x (game default)"},
+                new int[]{0, 2, 4}, GameConfig.KEY_MSAA_SAMPLES,
+                msaa >= 4 ? 2 : (msaa >= 2 ? 1 : 0));
+        stringSpinner("Anti-aliasing (post effect)", null,
+                new String[]{"None", "FXAA", "FXAA Extreme"},
+                new String[]{"none", "fxaa", "fxaa_extreme"}, GameConfig.KEY_FXAA,
+                GameConfig.DEFAULT_FXAA);
+        switchRow("Single-pass scene", "Faster; requires MSAA off.", GameConfig.KEY_SINGLE_PASS,
+                true);
+        switchRow("Occlusion queries", "Sun flares and light glows.", GameConfig.KEY_OCCLUSION,
+                true);
+        label("Upscaler: bilinear (this SDK build has no FidelityFX support).");
+    }
 
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
+    private void buildPresets() {
+        beginCard("Performance preset",
+                "A quick starting point. Fine-tune the options below afterwards.");
+        final int active = detectPreset();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < PRESETS.length; i++) {
+            final int index = i;
+            TextView chip = new TextView(this);
+            chip.setText(PRESET_NAMES[i] + "\n" + PRESET_HINTS[i]);
+            chip.setGravity(Gravity.CENTER);
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            chip.setTextColor(i == active ? Color.WHITE : COLOR_MUTED);
+            chip.setTypeface(null, i == active ? Typeface.BOLD : Typeface.NORMAL);
+            chip.setPadding(dp(8), dp(12), dp(8), dp(12));
+            chip.setBackground(i == active
+                    ? rounded(0x3319C6E6, COLOR_ACCENT, 12)
+                    : rounded(COLOR_FIELD, 0x22FFFFFF, 12));
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    applyPreset(index);
+                    rebuildUi();
+                    toast(PRESET_NAMES[index] + " preset applied");
+                }
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            params.rightMargin = i < PRESETS.length - 1 ? dp(8) : 0;
+            row.addView(chip, params);
+        }
+        LinearLayout.LayoutParams rowParams = matchWrap();
+        rowParams.topMargin = dp(8);
+        current.addView(row, rowParams);
+        label(active < 0 ? "Current settings: custom" : "Current settings: "
+                + PRESET_NAMES[active]);
+    }
 
-        final String[] fxaaLabels = {"None", "FXAA", "FXAA Extreme"};
-        final String[] fxaaValues = {"none", "fxaa", "fxaa_extreme"};
-        String fxaa = prefs.getString(GameConfig.KEY_FXAA, GameConfig.DEFAULT_FXAA);
-        int fxaaSelection = 0;
-        for (int i = 0; i < fxaaValues.length; i++) {
-            if (fxaaValues[i].equals(fxaa)) {
-                fxaaSelection = i;
+    private int detectPreset() {
+        int[] now = {
+                prefs.getInt(GameConfig.KEY_RENDER_SCALE, 100),
+                prefs.getInt(GameConfig.KEY_FPS_CAP, 60),
+                prefs.getBoolean(GameConfig.KEY_BLOOM, false) ? 1 : 0,
+                prefs.getInt(GameConfig.KEY_REFLECTIONS, 2),
+                prefs.getBoolean(GameConfig.KEY_MIRROR_HALF, true) ? 1 : 0,
+                prefs.getInt(GameConfig.KEY_ANISO, 3),
+        };
+        for (int i = 0; i < PRESETS.length; i++) {
+            boolean same = true;
+            for (int j = 0; j < now.length; j++) {
+                if (now[j] != PRESETS[i][j]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return i;
             }
         }
-        spinnerRow("Anti-aliasing (post effect)", fxaaLabels, fxaaSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putString(GameConfig.KEY_FXAA,
-                                fxaaValues[position]).apply();
-                    }
+        return -1;
+    }
 
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-
-        label("Upscaler: Bilinear (this SDK build has no FidelityFX support)");
+    private void applyPreset(int index) {
+        int[] p = PRESETS[index];
+        prefs.edit()
+                .putInt(GameConfig.KEY_RENDER_SCALE, p[0])
+                .putInt(GameConfig.KEY_FPS_CAP, p[1])
+                .putBoolean(GameConfig.KEY_BLOOM, p[2] != 0)
+                .putInt(GameConfig.KEY_REFLECTIONS, p[3])
+                .putBoolean(GameConfig.KEY_MIRROR_HALF, p[4] != 0)
+                .putInt(GameConfig.KEY_ANISO, p[5])
+                .apply();
     }
 
     // --------------------------------------------------------------- Game data
 
     private void buildGameData() {
-        section(R.string.game_data);
+        beginCard("Game data", null);
         isoValue = label("");
+        isoValue.setTextColor(COLOR_TEXT);
+        isoValue.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
         updateIsoLabel();
 
-        button("Pick ISO file (copies into app storage)", new View.OnClickListener() {
+        beginCard("Choose game data", "Copy mode is the safe default; direct paths skip the "
+                + "copy but some devices cannot memory-map large files from shared storage.");
+        primaryButton("Pick ISO file (copies into app storage)", new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -384,10 +490,8 @@ public class SettingsActivity extends Activity {
             }
         });
 
-        label("Copy mode is the safe default: the ISO lives at "
-                + new File(getFilesDir(), "game.iso").getAbsolutePath()
-                + ". Direct paths skip the copy but some devices cannot memory-map large "
-                + "files from shared storage.");
+        label("A copied ISO lives at " + new File(getFilesDir(), "game.iso").getAbsolutePath()
+                + ".");
     }
 
     private void updateIsoLabel() {
@@ -527,13 +631,109 @@ public class SettingsActivity extends Activity {
 
     // -------------------------------------------------------------- GPU driver
 
+    private static boolean isArm64() {
+        return Build.SUPPORTED_ABIS.length > 0 && "arm64-v8a".equals(Build.SUPPORTED_ABIS[0]);
+    }
+
     private void buildDriver() {
-        section(R.string.gpu_driver);
-        driverContainer = new LinearLayout(this);
-        driverContainer.setOrientation(LinearLayout.VERTICAL);
-        container.addView(driverContainer, matchWrap());
-        populateDrivers();
-        button("Import driver (.so or .zip)", new View.OnClickListener() {
+        final List<DriverStore.Driver> drivers = DriverStore.list(this);
+        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
+        DriverStore.Driver active = null;
+        for (DriverStore.Driver driver : drivers) {
+            if (driver.loader.getAbsolutePath().equals(selected)) {
+                active = driver;
+            }
+        }
+
+        // ---- Active driver status
+        beginCard("Active driver", null);
+        String name;
+        String detail;
+        int color;
+        if (active == null) {
+            name = "System Vulkan driver";
+            detail = "The driver built into your phone. Always works.";
+            color = COLOR_OK;
+        } else if (active.isFullLoader) {
+            name = active.label;
+            detail = "Full Vulkan loader, loaded directly.";
+            color = COLOR_ACCENT;
+        } else if (isArm64()) {
+            name = active.label;
+            detail = "Adreno driver (turnip), opened next to the system loader with "
+                    + "libadrenotools. Qualcomm Adreno GPUs only.";
+            color = COLOR_ACCENT;
+        } else {
+            name = active.label;
+            detail = "Adreno driver packages need a 64-bit ARM phone. The system driver will "
+                    + "be used instead.";
+            color = COLOR_WARN;
+        }
+        LinearLayout status = new LinearLayout(this);
+        status.setOrientation(LinearLayout.HORIZONTAL);
+        status.setGravity(Gravity.CENTER_VERTICAL);
+        View dot = new View(this);
+        GradientDrawable dotShape = new GradientDrawable();
+        dotShape.setShape(GradientDrawable.OVAL);
+        dotShape.setColor(color);
+        dot.setBackground(dotShape);
+        status.addView(dot, new LinearLayout.LayoutParams(dp(12), dp(12)));
+        TextView nameView = new TextView(this);
+        nameView.setText(name);
+        nameView.setTextColor(Color.WHITE);
+        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
+        nameView.setTypeface(null, Typeface.BOLD);
+        LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        nameParams.leftMargin = dp(10);
+        status.addView(nameView, nameParams);
+        LinearLayout.LayoutParams statusParams = matchWrap();
+        statusParams.topMargin = dp(8);
+        current.addView(status, statusParams);
+        label(detail);
+        label("This phone: " + Build.MODEL + "  |  " + (Build.SUPPORTED_ABIS.length > 0
+                ? Build.SUPPORTED_ABIS[0] : "unknown ABI") + "  |  Android "
+                + Build.VERSION.RELEASE);
+
+        // ---- Driver list
+        beginCard("Available drivers", "Tap a driver to use it. Changes apply the next time "
+                + "the game starts.");
+        driverRow("System Vulkan driver", "Built into the phone", active == null, null,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
+                        rebuildUi();
+                    }
+                }, null);
+        for (final DriverStore.Driver driver : drivers) {
+            String kind = driver.isFullLoader ? "Full Vulkan loader" : "Adreno driver (turnip)";
+            driverRow(driver.label, kind, driver == active || (active != null
+                            && driver.id.equals(active.id)), driver,
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER,
+                                    driver.loader.getAbsolutePath()).apply();
+                            rebuildUi();
+                        }
+                    },
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            confirmRemoveDriver(driver);
+                        }
+                    });
+        }
+        if (drivers.isEmpty()) {
+            label("No custom drivers imported yet.");
+        }
+
+        // ---- Import
+        beginCard("Import a driver", "Download a turnip / Adreno driver .zip (the kind with a "
+                + "meta.json and a libvulkan_freedreno.so), or pick a full libvulkan.so loader. "
+                + "It is copied into app storage.");
+        primaryButton("Import driver (.zip or .so)", new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -546,109 +746,74 @@ public class SettingsActivity extends Activity {
                 }
             }
         });
-        button("Remove selected driver", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                removeSelectedDriver();
-            }
-        });
-        label("Only full Vulkan loader packages are supported (a libvulkan.so that exports "
-                + "vkGetInstanceProcAddr, for example a Winlator-style turnip build). ICD-only "
-                + "packages with a driver JSON are not supported. Imported drivers are copied "
-                + "into app storage.");
+        label("If a custom driver cannot be opened the game falls back to the system driver. "
+                + "The reason is logged under the tag nfscarbon-driver.");
     }
 
-    private void populateDrivers() {
-        driverContainer.removeAllViews();
-        final List<DriverStore.Driver> drivers = DriverStore.list(this);
-        List<String> names = new ArrayList<>();
-        names.add("System Vulkan");
-        for (DriverStore.Driver driver : drivers) {
-            names.add(driver.label);
+    private void driverRow(String title, String subtitle, boolean selected,
+                           DriverStore.Driver driver, View.OnClickListener select,
+                           View.OnClickListener remove) {
+        rowGap();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(10), 0, dp(10));
+        row.setOnClickListener(select);
+
+        TextView radio = new TextView(this);
+        radio.setText(selected ? "●" : "○");
+        radio.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f);
+        radio.setTextColor(selected ? COLOR_ACCENT : COLOR_MUTED);
+        radio.setPadding(0, 0, dp(12), 0);
+        row.addView(radio, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(COLOR_TEXT);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        texts.addView(titleView, matchWrap());
+        TextView sub = new TextView(this);
+        sub.setText(subtitle);
+        sub.setTextColor(COLOR_MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        texts.addView(sub, matchWrap());
+        row.addView(texts, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (remove != null) {
+            TextView removeView = new TextView(this);
+            removeView.setText("Remove");
+            removeView.setTextColor(0xFFFF7B72);
+            removeView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            removeView.setPadding(dp(12), dp(6), dp(4), dp(6));
+            removeView.setOnClickListener(remove);
+            row.addView(removeView, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         }
-        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
-        int selection = 0;
-        for (int i = 0; i < drivers.size(); i++) {
-            if (drivers.get(i).loader.getAbsolutePath().equals(selected)) {
-                selection = i + 1;
-            }
-        }
-
-        TextView title = new TextView(this);
-        title.setText("Vulkan driver");
-        title.setTextColor(COLOR_MUTED);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        driverContainer.addView(title, matchWrap());
-
-        Spinner spinner = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, names);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        spinner.setAdapter(adapter);
-        spinner.setSelection(selection);
-        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                if (position == 0) {
-                    prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
-                } else {
-                    DriverStore.Driver driver = drivers.get(position - 1);
-                    prefs.edit()
-                            .putString(GameConfig.KEY_DRIVER_LOADER,
-                                    driver.loader.getAbsolutePath())
-                            .apply();
-                }
-                showDriverWarning(drivers, position);
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-        driverContainer.addView(spinner, matchWrap());
-        showDriverWarning(drivers, selection);
+        current.addView(row, matchWrap());
     }
 
-    private void showDriverWarning(List<DriverStore.Driver> drivers, int position) {
-        TextView previous = driverWarning;
-        if (previous != null) {
-            driverContainer.removeView(previous);
-            driverWarning = null;
-        }
-        if (position <= 0 || position > drivers.size()) {
-            return;
-        }
-        DriverStore.Driver driver = drivers.get(position - 1);
-        if (driver.isFullLoader) {
-            return;
-        }
-        TextView warning = new TextView(this);
-        warning.setText("This package contains an ICD/HAL driver, not a full Vulkan loader, "
-                + "so it cannot be used on Android (the OS only loads vendor ICDs from "
-                + "/vendor). The game will fall back to the system Vulkan driver. Import a "
-                + "package that includes a full libvulkan.so loader instead.");
-        warning.setTextColor(0xFFFFB74D);
-        warning.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        warning.setPadding(0, dp(4), 0, dp(4));
-        driverContainer.addView(warning, matchWrap());
-        driverWarning = warning;
-    }
-
-    private void removeSelectedDriver() {
-        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
-        if (selected == null || selected.isEmpty()) {
-            toast("System driver cannot be removed");
-            return;
-        }
-        for (DriverStore.Driver driver : DriverStore.list(this)) {
-            if (driver.loader.getAbsolutePath().equals(selected)) {
-                DriverStore.remove(driver);
-                prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
-                populateDrivers();
-                toast("Driver removed");
-                return;
-            }
-        }
+    private void confirmRemoveDriver(final DriverStore.Driver driver) {
+        new AlertDialog.Builder(this)
+                .setTitle("Remove driver?")
+                .setMessage(driver.label + " will be deleted from app storage.")
+                .setPositiveButton("Remove", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
+                        DriverStore.remove(driver);
+                        if (driver.loader.getAbsolutePath().equals(selected)) {
+                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
+                        }
+                        rebuildUi();
+                        toast("Driver removed");
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
     }
 
     // ----------------------------------------------------------- Touch controls
@@ -880,40 +1045,88 @@ public class SettingsActivity extends Activity {
     // -------------------------------------------------------------------- About
 
     private void buildAbout() {
-        section(R.string.about);
-        label("NFS Carbon Android launcher for the ReXGlue recompilation.\n"
-                + "Game data: Need for Speed: Carbon (Xbox 360) ISO or extracted folder.\n"
-                + "Rendering: native Vulkan renderer (carbon GPU plugin), or Xenos emulation "
-                + "(xenos GPU plugin) as a fallback.");
+        beginCard("NFS Carbon", null);
+        String version = "";
+        try {
+            version = "Version " + getPackageManager().getPackageInfo(getPackageName(), 0)
+                    .versionName;
+        } catch (Exception ignored) {
+        }
+        label(version);
+        label("Need for Speed: Carbon (Xbox 360) running natively on Android through a static "
+                + "recompilation. Game data: your own ISO or extracted game folder.");
+        beginCard("Rendering", null);
+        label("Native Vulkan renderer (the carbon GPU plugin), written for this project. Xenos "
+                + "emulation (the xenos plugin) stays available as a fallback.");
+        beginCard("Credits", null);
+        label("ReXGlue SDK: recompilation runtime.");
+        label("libadrenotools by Billy Laws (BSD-2-Clause): loading downloaded Adreno / turnip "
+                + "drivers.");
     }
 
     // ------------------------------------------------------------------ Helpers
-
-    private void rebuildUi() {
-        container.removeAllViews();
-        buildGraphics();
-        buildGameData();
-        buildDriver();
-        buildTouch();
-        buildAbout();
-    }
 
     private interface ValueListener {
         void onValue(float value);
     }
 
-    private TextView section(int titleRes) {
-        TextView view = new TextView(this);
-        view.setText(titleRes);
-        view.setTextColor(COLOR_ACCENT);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
-        view.setPadding(0, dp(22), 0, dp(6));
-        container.addView(view, matchWrap());
-        return view;
+    private abstract static class SimpleWatcher implements TextWatcher {
+        @Override
+        public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+        }
+
+        @Override
+        public void onTextChanged(CharSequence s, int start, int before, int count) {
+        }
+    }
+
+    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(fill);
+        drawable.setStroke(dp(1), stroke);
+        drawable.setCornerRadius(dp(radiusDp));
+        return drawable;
+    }
+
+    private void section(int titleRes) {
+        beginCard(getString(titleRes), null);
+    }
+
+    private void beginCard(String title, String hint) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackgroundResource(R.drawable.bg_card);
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout.LayoutParams params = matchWrap();
+        params.topMargin = dp(12);
+        container.addView(card, params);
+        current = card;
+        rowsInCard = 0;
+        if (title != null) {
+            TextView view = new TextView(this);
+            view.setText(title.toUpperCase(Locale.US));
+            view.setTextColor(COLOR_ACCENT);
+            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            view.setTypeface(null, Typeface.BOLD);
+            view.setLetterSpacing(0.1f);
+            card.addView(view, matchWrap());
+        }
+        if (hint != null) {
+            label(hint);
+        }
+    }
+
+    private void rowGap() {
+        if (rowsInCard++ > 0) {
+            View divider = new View(this);
+            divider.setBackgroundColor(0x1AFFFFFF);
+            current.addView(divider, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        }
     }
 
     private TextView label(String text) {
-        return labelInto(container, text);
+        return labelInto(current, text);
     }
 
     private TextView labelInto(LinearLayout parent, String text) {
@@ -926,35 +1139,115 @@ public class SettingsActivity extends Activity {
         return view;
     }
 
-    private android.widget.CheckBox switchRow(String title, final String key,
-                                              boolean defaultValue) {
-        android.widget.CheckBox view = new android.widget.CheckBox(this);
-        view.setText(title);
-        view.setTextColor(COLOR_TEXT);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        view.setPadding(0, dp(10), 0, dp(10));
-        view.setButtonTintList(android.content.res.ColorStateList.valueOf(0xFF58A6FF));
-        view.setChecked(prefs.getBoolean(key, defaultValue));
-        view.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
+    private Switch switchRow(String title, final String key, boolean defaultValue) {
+        return switchRow(title, null, key, defaultValue);
+    }
+
+    private Switch switchRow(String title, String hint, final String key,
+                             boolean defaultValue) {
+        rowGap();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(10), 0, dp(10));
+
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(COLOR_TEXT);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        texts.addView(titleView, matchWrap());
+        if (hint != null) {
+            TextView hintView = new TextView(this);
+            hintView.setText(hint);
+            hintView.setTextColor(COLOR_MUTED);
+            hintView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            texts.addView(hintView, matchWrap());
+        }
+        row.addView(texts, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        final Switch toggle = new Switch(this);
+        int[][] states = {{android.R.attr.state_checked}, {}};
+        toggle.setThumbTintList(new ColorStateList(states,
+                new int[]{COLOR_ACCENT, 0xFFB0B8C2}));
+        toggle.setTrackTintList(new ColorStateList(states,
+                new int[]{0x6619C6E6, 0x44FFFFFF}));
+        toggle.setChecked(prefs.getBoolean(key, defaultValue));
+        toggle.setOnCheckedChangeListener(
+                new android.widget.CompoundButton.OnCheckedChangeListener() {
+                    @Override
+                    public void onCheckedChanged(android.widget.CompoundButton buttonView,
+                                                 boolean isChecked) {
+                        prefs.edit().putBoolean(key, isChecked).apply();
+                    }
+                });
+        row.setOnClickListener(new View.OnClickListener() {
             @Override
-            public void onCheckedChanged(android.widget.CompoundButton buttonView,
-                                         boolean isChecked) {
-                prefs.edit().putBoolean(key, isChecked).apply();
+            public void onClick(View view) {
+                toggle.toggle();
             }
         });
-        container.addView(view, matchWrap());
+        row.addView(toggle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        current.addView(row, matchWrap());
+        return toggle;
+    }
+
+    private ArrayAdapter<String> styledAdapter(String[] items) {
+        return new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                return tint(super.getView(position, convertView, parent), false);
+            }
+
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                return tint(super.getDropDownView(position, convertView, parent), true);
+            }
+        };
+    }
+
+    private View tint(View view, boolean dropDown) {
+        if (view instanceof TextView) {
+            TextView text = (TextView) view;
+            text.setTextColor(COLOR_TEXT);
+            text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+            text.setPadding(dp(12), dp(12), dp(12), dp(12));
+            if (dropDown) {
+                text.setBackgroundColor(COLOR_FIELD);
+            }
+        }
         return view;
     }
 
     private Spinner spinnerRow(String title, String[] items, int selection,
+                               AdapterView.OnItemSelectedListener listener) {
+        return spinnerRow(title, null, items, selection, listener);
+    }
+
+    private Spinner spinnerRow(String title, String hint, String[] items, int selection,
                                final AdapterView.OnItemSelectedListener listener) {
-        label(title);
+        rowGap();
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(COLOR_TEXT);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        titleView.setPadding(0, dp(10), 0, 0);
+        current.addView(titleView, matchWrap());
+        if (hint != null) {
+            TextView hintView = new TextView(this);
+            hintView.setText(hint);
+            hintView.setTextColor(COLOR_MUTED);
+            hintView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+            current.addView(hintView, matchWrap());
+        }
         final Spinner spinner = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, items);
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        spinner.setAdapter(adapter);
+        spinner.setAdapter(styledAdapter(items));
         spinner.setSelection(selection);
+        spinner.setBackground(rounded(COLOR_FIELD, 0x33FFFFFF, 10));
+        spinner.setPopupBackgroundDrawable(new ColorDrawable(COLOR_FIELD));
         // Attach after the first layout: Spinner emits an initial onItemSelected
         // for the programmatic selection, which must not be treated as a user
         // change (it would silently overwrite persisted settings).
@@ -964,15 +1257,82 @@ public class SettingsActivity extends Activity {
                 spinner.setOnItemSelectedListener(listener);
             }
         });
-        container.addView(spinner, matchWrap());
+        LinearLayout.LayoutParams params = matchWrap();
+        params.topMargin = dp(6);
+        params.bottomMargin = dp(8);
+        current.addView(spinner, params);
         return spinner;
+    }
+
+    private Spinner intSpinner(String title, String hint, String[] labels, final int[] values,
+                               final String key, int defaultValue) {
+        int stored = prefs.getInt(key, defaultValue);
+        int selection = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] == defaultValue) {
+                selection = i;
+            }
+        }
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] == stored) {
+                selection = i;
+            }
+        }
+        return intSpinnerAt(title, hint, labels, values, key, selection);
+    }
+
+    private Spinner intSpinnerAt(String title, String hint, String[] labels, final int[] values,
+                                 final String key, int selection) {
+        return spinnerRow(title, hint, labels, selection,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putInt(key, values[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
+    }
+
+    private Spinner stringSpinner(String title, String hint, String[] labels,
+                                  final String[] values, final String key,
+                                  String defaultValue) {
+        String stored = prefs.getString(key, defaultValue);
+        int selection = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(stored)) {
+                selection = i;
+            }
+        }
+        return spinnerRow(title, hint, labels, selection,
+                new AdapterView.OnItemSelectedListener() {
+                    @Override
+                    public void onItemSelected(AdapterView<?> parent, View view, int position,
+                                               long id) {
+                        prefs.edit().putString(key, values[position]).apply();
+                    }
+
+                    @Override
+                    public void onNothingSelected(AdapterView<?> parent) {
+                    }
+                });
     }
 
     private SeekBar seekRow(String title, float min, float max, float value,
                             final ValueListener listener) {
-        final TextView valueLabel = label("");
+        rowGap();
+        final TextView valueLabel = new TextView(this);
+        valueLabel.setTextColor(COLOR_TEXT);
+        valueLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        valueLabel.setPadding(0, dp(10), 0, 0);
+        current.addView(valueLabel, matchWrap());
         final SeekBar bar = new SeekBar(this);
         bar.setMax(1000);
+        bar.setProgressTintList(ColorStateList.valueOf(COLOR_ACCENT));
+        bar.setThumbTintList(ColorStateList.valueOf(COLOR_ACCENT));
         final float range = max - min;
         bar.setProgress(Math.round((value - min) / range * 1000f));
         final String titleText = title;
@@ -980,10 +1340,10 @@ public class SettingsActivity extends Activity {
         bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                float current = min + range * progress / 1000f;
-                valueLabel.setText(titleText + ": " + String.format(Locale.US, "%.2f", current));
+                float shown = min + range * progress / 1000f;
+                valueLabel.setText(titleText + ": " + String.format(Locale.US, "%.2f", shown));
                 if (fromUser) {
-                    listener.onValue(current);
+                    listener.onValue(shown);
                 }
             }
 
@@ -995,7 +1355,9 @@ public class SettingsActivity extends Activity {
             public void onStopTrackingTouch(SeekBar seekBar) {
             }
         });
-        container.addView(bar, matchWrap());
+        LinearLayout.LayoutParams params = matchWrap();
+        params.bottomMargin = dp(6);
+        current.addView(bar, params);
         return bar;
     }
 
@@ -1005,10 +1367,16 @@ public class SettingsActivity extends Activity {
         edit.setText(value);
         edit.setTextColor(COLOR_TEXT);
         edit.setHintTextColor(COLOR_MUTED);
-        edit.setBackgroundColor(0xFF161B22);
+        edit.setBackground(rounded(COLOR_FIELD, 0x33FFFFFF, 10));
         edit.setPadding(dp(12), dp(12), dp(12), dp(12));
         edit.setInputType(InputType.TYPE_CLASS_NUMBER);
         return edit;
+    }
+
+    private void addField(EditText field) {
+        LinearLayout.LayoutParams params = matchWrap();
+        params.bottomMargin = dp(8);
+        current.addView(field, params);
     }
 
     private Button button(String text, View.OnClickListener listener) {
@@ -1016,11 +1384,18 @@ public class SettingsActivity extends Activity {
         button.setText(text);
         button.setAllCaps(false);
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(COLOR_BUTTON);
+        button.setBackgroundResource(R.drawable.bg_button_secondary);
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = matchWrap();
-        params.topMargin = dp(6);
-        container.addView(button, params);
+        params.topMargin = dp(8);
+        current.addView(button, params);
+        return button;
+    }
+
+    private Button primaryButton(String text, View.OnClickListener listener) {
+        Button button = button(text, listener);
+        button.setBackgroundResource(R.drawable.bg_play);
+        button.setTypeface(null, Typeface.BOLD);
         return button;
     }
 
@@ -1093,13 +1468,12 @@ public class SettingsActivity extends Activity {
                                         driver.loader.getAbsolutePath())
                                 .putString(GameConfig.KEY_DRIVER_LABEL, driver.label)
                                 .apply();
-                        populateDrivers();
+                        rebuildUi();
                         if (driver.isFullLoader) {
                             toast("Imported " + driver.label);
                         } else {
-                            toast("Imported " + driver.label + " - but this is an ICD/HAL "
-                                    + "package, not a full Vulkan loader; it cannot be used "
-                                    + "on Android and the system driver will be used instead.");
+                            toast("Imported " + driver.label + " (Adreno driver, used on "
+                                    + "next game start)");
                         }
                     }
                 });
