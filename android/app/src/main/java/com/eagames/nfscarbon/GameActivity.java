@@ -53,7 +53,8 @@ public class GameActivity extends NfsCarbonActivity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // The game never needs more than 60 Hz: asking the display for 60 Hz halves the
         // compositing work (and heat) on a 120 Hz panel.
-        if (GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60) != 0) {
+        int userFpsCap = GameConfig.prefs(this).getInt(GameConfig.KEY_FPS_CAP, 60);
+        if (userFpsCap != 0) {
             WindowManager.LayoutParams attributes = getWindow().getAttributes();
             attributes.preferredRefreshRate = 60.0f;
             getWindow().setAttributes(attributes);

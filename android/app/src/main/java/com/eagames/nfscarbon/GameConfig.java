@@ -140,7 +140,13 @@ public final class GameConfig {
         values.put("texture_cache_memory_limit_soft_lifetime", "120");
 
         values.put("game_data_root", quote(p.getString(KEY_ISO_PATH, "")));
-        values.put("vulkan_loader", quote(p.getString(KEY_DRIVER_LOADER, "")));
+        String driverPath = p.getString(KEY_DRIVER_LOADER, "");
+        boolean driverIsLoader = driverPath.isEmpty()
+                || DriverStore.exportsVulkanLoaderEntryPoint(new java.io.File(driverPath));
+        // Full loaders are dlopen'ed directly; downloaded ICD drivers (turnip) go
+        // through libadrenotools.
+        values.put("vulkan_loader", quote(driverIsLoader ? driverPath : ""));
+        values.put("vulkan_icd_driver", quote(driverIsLoader ? "" : driverPath));
 
         values.put("input_backend", quote("sdl"));
         values.put("mnk_mode", "false");

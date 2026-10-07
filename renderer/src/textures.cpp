@@ -505,6 +505,10 @@ void Renderer::BindTextures(const RegisterFile& regs, Shader* shader, uint32_t s
         signs |= (s & 3) << (comp * 2);
       }
     }
+    if (t && t->has_unsampled) {
+      for (ResolveSig& s : t->resolve_sigs) s.sampled = true;
+      t->has_unsampled = false;
+    }
     if (t && t->resolved) {
       // Resolved data already went through the render target's own encoding.
       signs = 0;

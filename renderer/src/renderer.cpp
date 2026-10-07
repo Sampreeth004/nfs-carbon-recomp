@@ -11,6 +11,10 @@
 #include <fstream>
 #include <thread>
 #include <type_traits>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/system/gpu_plugin.h>
@@ -42,6 +46,9 @@ REXCVAR_DEFINE_INT32(carbon_gpu_dump_frame_interval, 0, "CarbonGPU",
 REXCVAR_DEFINE_INT32(carbon_gpu_vertex_arena_mb, 128, "CarbonGPU",
                      "Size of the persistent vertex buffer cache (0 = upload vertices every frame)")
     .range(0, 1024);
+REXCVAR_DEFINE_BOOL(carbon_gpu_skip_redundant_resolves, true, "CarbonGPU",
+                    "Skip resolves whose source contents, rectangle and parameters match the "
+                    "previous resolve into the same destination region (false = always copy)");
 REXCVAR_DEFINE_BOOL(carbon_gpu_vertex_ranges, true, "CarbonGPU",
                     "Copy only the part of a vertex buffer the draw's indices reach");
 #if defined(__ANDROID__)
@@ -485,6 +492,48 @@ void Renderer::InitializeShaderStorage(const std::filesystem::path& cache_root,
   }
 }
 
+#if defined(__ANDROID__)
+void Renderer::InitAdpf() {
+  // libandroid.so is always loaded; RTLD_NOLOAD avoids a dlopen ref count.
+  void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_NOLOAD);
+  if (!lib) {
+    lib = dlopen("libandroid.so", RTLD_NOW);  // fallback: load it ourselves
+    if (!lib) return;
+  }
+
+  using GetManagerFn    = void* (*)(void);
+  using CreateSessionFn = void* (*)(void*, const int32_t*, size_t, int64_t);
+
+  const auto get_mgr    = reinterpret_cast<GetManagerFn>(dlsym(lib, "APerformanceHint_getManager"));
+  const auto create_ses = reinterpret_cast<CreateSessionFn>(dlsym(lib, "APerformanceHintManager_createSession"));
+  adpf_report_fn_       = reinterpret_cast<decltype(adpf_report_fn_)>(
+      dlsym(lib, "APerformanceHintSession_reportActualWorkDuration"));
+  adpf_update_fn_       = reinterpret_cast<decltype(adpf_update_fn_)>(
+      dlsym(lib, "APerformanceHintSession_updateTargetWorkDuration"));
+
+  if (!get_mgr || !create_ses || !adpf_report_fn_ || !adpf_update_fn_) {
+    // API < 33, or symbols not present — no-op gracefully.
+    adpf_report_fn_ = nullptr;
+    adpf_update_fn_ = nullptr;
+    return;
+  }
+
+  void* mgr = get_mgr();
+  if (!mgr) return;
+
+  // Target: fps_cap_ if set, otherwise 60 fps as a reasonable default.
+  const int64_t target_ns = fps_cap_ > 0 ? int64_t(1e9 / fps_cap_) : int64_t(16'666'667LL);
+  const int32_t tid = static_cast<int32_t>(gettid());
+  adpf_session_ = create_ses(mgr, &tid, 1, target_ns);
+  adpf_last_cap_ = fps_cap_;
+
+  if (adpf_session_) {
+    REXGPU_INFO("[carbon-gpu] ADPF hint session created (target {:.2f} ms, tid {})",
+                double(target_ns) / 1e6, tid);
+  }
+}
+#endif
+
 void Renderer::SavePipelineCache() {
   if (pipeline_cache_path_.empty() || !pipeline_cache_) {
     return;
@@ -824,6 +873,7 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
   }
   stats_.gpu_total_s += total;
   ++stats_.gpu_frames;
+  gpu_ms_hist_.push_back(float(total * 1000.0));
   for (uint32_t i = 1; i < n; ++i) {
     double dt = double(results[i] - results[i - 1]) * ts_period_ns_ * 1e-9;
     if (dt > 0.0 && dt < 1.0) {
@@ -2319,6 +2369,11 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
     cmd_.pipeline = pipeline;
   }
   ++pass_draws_;
+  // Contents change: invalidates any earlier resolve that read these targets.
+  for (RenderTarget* rt : current_pass_.color) {
+    if (rt) rt->write_gen = ++rt_write_counter_;
+  }
+  if (current_pass_.depth) current_pass_.depth->write_gen = ++rt_write_counter_;
   pass_ps_hash_ = ps ? ps->hash : 0;
   pass_vs_hash_ = vs->hash;
   VkPipelineLayout layout = GetPipelineLayout(key.vs_textures, key.ps_textures);
@@ -2614,6 +2669,20 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     cap_next_ = 0.0;
   }
+  // Re-read fps_cap_ each frame so runtime cvar changes take effect immediately.
+  fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
+  skip_redundant_resolves_ = REXCVAR_GET(carbon_gpu_skip_redundant_resolves);
+
+#if defined(__ANDROID__)
+  // Lazy ADPF init: called on the rendering thread so gettid() gives the
+  // right TID.  Must happen after the first fps_cap_ read above.
+  if (!adpf_init_tried_) {
+    adpf_init_tried_ = true;
+    InitAdpf();
+  }
+  const double adpf_work_start = NowSeconds();
+#endif
+
   struct Timer {
     double& total;
     double start = NowSeconds();
@@ -2637,6 +2706,10 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
 
   // The front buffer is normally the destination of the last resolve.
   Texture* front = FindResolvedTexture(frontbuffer_ptr & 0x1FFFFFFF, width, height);
+  if (front && front->has_unsampled) {
+    for (ResolveSig& s : front->resolve_sigs) s.sampled = true;
+    front->has_unsampled = false;
+  }
   if (!front) {
     // Not resolved this way: try the guest texture in memory.
     GuestTexture g;
@@ -2728,6 +2801,22 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     vmaDestroyBuffer(allocator_, dump_buffer, dump_allocation);
   }
 
+#if defined(__ANDROID__)
+  // Report actual work duration to ADPF *before* the fps cap sleep, so the
+  // scheduler sees the real cost, not the artificial idle.
+  if (adpf_session_ && adpf_report_fn_ && adpf_update_fn_) {
+    const int64_t actual_ns = std::max(int64_t(1'000'000LL),
+        int64_t((NowSeconds() - adpf_work_start) * 1e9));
+    adpf_report_fn_(adpf_session_, actual_ns);
+    if (fps_cap_ != adpf_last_cap_) {
+      adpf_last_cap_ = fps_cap_;
+      const int64_t target_ns = fps_cap_ > 0
+          ? int64_t(1e9 / fps_cap_) : int64_t(16'666'667LL);
+      adpf_update_fn_(adpf_session_, target_ns);
+    }
+  }
+#endif
+
   // Frame rate cap: hold the command thread so the guest sees steady pacing and
   // the SoC is not driven faster than needed.
   if (fps_cap_ > 0) {
@@ -2760,6 +2849,7 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   if (overlay_last_swap_ > 0.0) {
     double dt_ms = (now - overlay_last_swap_) * 1000.0;
     stats_.worst_ms = std::max(stats_.worst_ms, dt_ms);
+    frame_ms_hist_.push_back(float(dt_ms));
     stats_.slow25 += dt_ms > 25.0;
     stats_.slow34 += dt_ms > 34.0;
     stats_.slow50 += dt_ms > 50.0;
@@ -2832,6 +2922,19 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
         }
         pass_agg_.clear();
         double g = double(stats_.gpu_frames);
+        {
+          auto pct = [](std::vector<float>& v, double p) {
+            if (v.empty()) return 0.0f;
+            size_t k = std::min(v.size() - 1, size_t(p * double(v.size())));
+            std::nth_element(v.begin(), v.begin() + k, v.end());
+            return v[k];
+          };
+          REXGPU_INFO(
+              "[carbon-gpu] frame time ms p50/p95/p99 {:.1f}/{:.1f}/{:.1f} | gpu time ms "
+              "p50/p95/p99 {:.1f}/{:.1f}/{:.1f}",
+              pct(frame_ms_hist_, 0.50), pct(frame_ms_hist_, 0.95), pct(frame_ms_hist_, 0.99),
+              pct(gpu_ms_hist_, 0.50), pct(gpu_ms_hist_, 0.95), pct(gpu_ms_hist_, 0.99));
+        }
         REXGPU_INFO(
             "[carbon-gpu] gpu time per frame: total {:.1f} ms | scene passes {:.1f}, other passes {:.1f}, "
             "resolves {:.1f}, present+tail {:.1f} (passes {:.0f})",
@@ -2840,6 +2943,39 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
             stats_.gpu_tag_s[kTagEnd] * 1000.0 / g, stats_.gpu_passes / g);
       }
     }
+    if (REXCVAR_GET(carbon_gpu_stats)) {
+      double f = double(std::max<uint64_t>(stats_frames_, 1));
+      REXGPU_INFO(
+          "[carbon-gpu] resolves per frame: copied {:.1f}, skipped as redundant {:.1f} | pixels "
+          "copied {:.0f} k, skipped {:.0f} k | bandwidth copied {:.1f} MiB, avoided {:.1f} MiB "
+          "(skip {}) | overwritten before sampled: {:.1f} resolves, {:.0f} k px, {:.1f} MiB",
+          stats_.resolves_copied / f, stats_.resolves_skipped / f,
+          double(stats_.resolve_px_copied) / f / 1e3, double(stats_.resolve_px_skipped) / f / 1e3,
+          double(stats_.resolve_bytes_copied) / f / (1024.0 * 1024.0),
+          double(stats_.resolve_bytes_skipped) / f / (1024.0 * 1024.0),
+          REXCVAR_GET(carbon_gpu_skip_redundant_resolves) ? "on" : "off",
+          stats_.resolves_dead / f, double(stats_.resolve_px_dead) / f / 1e3,
+          double(stats_.resolve_bytes_dead) / f / (1024.0 * 1024.0));
+    }
+    if (REXCVAR_GET(carbon_gpu_stats) && !dest_agg_.empty()) {
+      std::vector<const DestAgg*> top;
+      for (auto& kv : dest_agg_) top.push_back(&kv.second);
+      std::sort(top.begin(), top.end(), [](const DestAgg* a, const DestAgg* b) {
+        return a->px * a->dead / std::max<uint32_t>(a->resolves, 1) >
+               b->px * b->dead / std::max<uint32_t>(b->resolves, 1);
+      });
+      double f = double(std::max<uint64_t>(stats_frames_, 1));
+      for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        const DestAgg& d = *top[i];
+        REXGPU_INFO(
+            "[carbon-gpu]   resolve dest {:08X} {}x{} fmt {} src pitch {} fmt {}: {:.2f}/frame, "
+            "{:.2f}/frame overwritten before sampled",
+            d.base, d.w, d.h, d.fmt, d.src_pitch, d.src_fmt, d.resolves / f, d.dead / f);
+      }
+    }
+    dest_agg_.clear();
+    frame_ms_hist_.clear();
+    gpu_ms_hist_.clear();
     stats_ = Stats();
     spike_reports_ = 0;
     stats_frames_ = 0;

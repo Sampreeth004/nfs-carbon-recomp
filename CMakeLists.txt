@@ -40,6 +40,10 @@ if(ANDROID)
     list(APPEND NFSCARBON_SOURCES src/render_mode_hook.cpp)
     # Stereo AAudio output instead of the SDL 5.1 stream.
     list(APPEND NFSCARBON_SOURCES src/android_aaudio.cpp)
+    # Downloaded Adreno ICD drivers (turnip) through libadrenotools; arm64 only.
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        list(APPEND NFSCARBON_SOURCES src/turnip_driver.cpp)
+    endif()
 endif()
 
 if(WIN32)
@@ -58,6 +62,14 @@ if(WIN32)
 endif()
 
 rexglue_setup_target(nfscarbon GPU_PLUGINS xenos)
+
+if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+    # libadrenotools (BSD-2-Clause). Its hook libraries (libhook_impl.so, libmain_hook.so,
+    # libfile_redirect_hook.so, libgsl_alloc_hook.so) must be copied into jniLibs/arm64-v8a.
+    add_subdirectory(third_party/libadrenotools)
+    target_link_libraries(nfscarbon PRIVATE adrenotools log)
+    add_dependencies(nfscarbon main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+endif()
 
 # Native Vulkan renderer plugin (gpu_plugin = "carbon"), see renderer/.
 option(NFSCARBON_BUILD_CARBON_GPU "Build the rexgpu-carbon native renderer plugin" ON)

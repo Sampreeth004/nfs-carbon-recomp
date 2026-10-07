@@ -82,3 +82,4 @@ extern "C" JNIEXPORT void JNICALL Java_com_eagames_nfscarbon_GameBridge_nativeSe
   }
   carbon::audio::SetOutputPaused(paused != JNI_FALSE);
 }
+
