@@ -44,6 +44,7 @@ class GpuSystem final : public rex::system::IGraphicsSystem {
   rex::memory::Memory* memory() const { return memory_; }
   rex::system::KernelState* kernel_state() const { return kernel_state_; }
   rex::ui::vulkan::VulkanProvider* vulkan_provider() const { return provider_.get(); }
+  bool NeedsHostFrameCap(int32_t cap) const;
 
   // Runs the guest interrupt callback on the calling XThread.
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
@@ -71,6 +72,7 @@ class GpuSystem final : public rex::system::IGraphicsSystem {
   std::unique_ptr<CommandProcessor> command_processor_;
 
   std::atomic<bool> vsync_running_{false};
+  double guest_refresh_hz_ = 60.0;  // Initialized before starting guest GPU threads.
   rex::system::object_ref<rex::system::XHostThread> vsync_thread_;
 };
 

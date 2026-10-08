@@ -1,6 +1,7 @@
 // Carbon native renderer: guest texture layout and CPU-side conversion.
 
 #include "texture_decode.h"
+#include "texture_copy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -128,10 +129,6 @@ LevelLocation LocateLevel(const GuestTexture& t, const TextureFormatInfo& info, 
     loc.z = z;
   }
   return loc;
-}
-
-inline uint8_t ReadByteSwapped(const uint8_t* mem, uint32_t addr, uint32_t xor_mask) {
-  return mem[(addr ^ xor_mask) & 0x1FFFFFFF];
 }
 
 uint32_t EndianXor(xenos::Endian e) {
@@ -549,6 +546,36 @@ void DecodeGuestTexture(const uint8_t* mem, const GuestTexture& t, const Texture
     for (uint32_t z = 0; z < r.depth; ++z) {
       uint8_t* out_slice = out + uint64_t(host_row_bytes) * host_rows * z;
       for (uint32_t by = 0; by < hb; ++by) {
+        if (info.conversion == TextureConversion::kNone &&
+            (host_is_blocks || (bw == 1 && bh == 1))) {
+          // Native BC blocks and unconverted texels need only an endian copy.
+          // 2D tiling has contiguous runs within each microtile; do not cross
+          // their boundary. 3D tiled blocks retain individual address lookup.
+          for (uint32_t bx = 0; bx < wb;) {
+            uint32_t gx = bx + loc.x_blocks, gy = by + loc.y_blocks;
+            uint32_t off, run;
+            if (t.tiled && is_pow2_bpb) {
+              if (is_3d) {
+                off = uint32_t(TiledOffset3D(int32_t(gx), int32_t(gy), int32_t(z + loc.z),
+                                            loc.row_pitch_blocks, loc.z_rows_blocks, bpb_log2));
+                run = 1;
+              } else {
+                off = uint32_t(TiledOffset2D(int32_t(gx), int32_t(gy), loc.row_pitch_blocks,
+                                            bpb_log2)) + r.layer * loc.slice_stride;
+                uint32_t micro_run = std::min(8u, std::max(1u, 16u / bpb));
+                run = std::min(wb - bx, micro_run - (gx & (micro_run - 1)));
+              }
+            } else {
+              off = r.layer * loc.slice_stride + (z + loc.z) * loc.row_pitch_bytes *
+                    loc.z_rows_blocks + gy * loc.row_pitch_bytes + gx * bpb;
+              run = wb - bx;
+            }
+            CopyTextureBytes(mem, loc.storage_base + off, run * bpb, xor_mask,
+                             out_slice + uint64_t(by) * host_row_bytes + uint64_t(bx) * bpb);
+            bx += run;
+          }
+          continue;
+        }
         for (uint32_t bx = 0; bx < wb; ++bx) {
           uint32_t gx = bx + loc.x_blocks, gy = by + loc.y_blocks, gz = z + loc.z;
           uint32_t off;
@@ -566,9 +593,7 @@ void DecodeGuestTexture(const uint8_t* mem, const GuestTexture& t, const Texture
                   gy * loc.row_pitch_bytes + gx * bpb;
           }
           uint32_t addr = loc.storage_base + off;
-          for (uint32_t i = 0; i < bpb; ++i) {
-            block[i] = ReadByteSwapped(mem, addr + i, xor_mask);
-          }
+          CopyTextureBytes(mem, addr, bpb, xor_mask, block);
           // Write to the host image.
           switch (info.conversion) {
             case TextureConversion::kNone: {

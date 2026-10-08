@@ -91,6 +91,10 @@ struct RenderTarget {
   // Rows the game actually resolves from this target. Passes only cover these,
   // so oversized targets do not cost a full load and store per pass.
   uint32_t used_rows = 0;
+  // Written as an attachment by a rendering pass since the last dependency that
+  // covers it. A later pass using it in the same layout needs an attachment ->
+  // attachment dependency (no layout transition would provide one).
+  bool attachment_written = false;
 };
 
 // What a resolve copied into a region of a resolved texture. A later resolve with
@@ -157,9 +161,11 @@ class Renderer {
   void OnCommandThreadStart();
   void OnCommandThreadStop();
   Shader* LoadShader(xenos::ShaderType type, const uint32_t* guest_be, uint32_t dword_count);
-  void OnFloatConstantWritten(uint32_t index) {
-    // index in dwords from c0.x; 1024 dwords per stage.
-    float_constants_dirty_[index >> 10] = true;
+  void OnFloatConstantsWritten(uint32_t index, uint32_t count, uint32_t changed) {
+    // A batch belongs to one stage, 1024 dwords per stage, starting at c0.x.
+    stats_.constant_words += count;
+    stats_.constant_words_changed += changed;
+    if (changed) float_constants_dirty_[index >> 10] = true;
   }
   void Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const DrawInfo& info);
   void Resolve(const RegisterFile& regs);
@@ -219,14 +225,24 @@ class Renderer {
     uint32_t width = 0, height = 0;
   };
   void EndRendering();
-  bool BeginRendering(const PassState& pass);
+  // `clear`: clear the pass's single attachment (color 0 or depth/stencil) over
+  // the whole render area with the load operation instead of loading it.
+  // `clear_area`: render area to use instead of the whole pass (the rectangle).
+  bool BeginRendering(const PassState& pass, const VkClearValue* clear = nullptr,
+                      const VkRect2D* clear_area = nullptr);
   bool rendering_ = false;
   PassState current_pass_;
 
   // ---- Barriers ----
+  // Layout transition whose stages and access masks follow from the old and new
+  // layouts (carbon_gpu_precise_barriers), or ALL_COMMANDS/MEMORY otherwise.
   void TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectFlags aspect,
                        VkImageLayout& layout, VkImageLayout new_layout, uint32_t levels = VK_REMAINING_MIP_LEVELS,
                        uint32_t layers = VK_REMAINING_ARRAY_LAYERS);
+  // Always ALL_COMMANDS/MEMORY: for images also used outside this renderer.
+  void TransitionImageConservative(VkCommandBuffer cb, VkImage image, VkImageAspectFlags aspect,
+                                   VkImageLayout& layout, VkImageLayout new_layout);
+  bool precise_barriers_ = true;
 
   // ---- Render targets (render_targets.cpp) ----
   RenderTarget* GetRenderTarget(bool depth, uint32_t edram_base, uint32_t pitch, uint32_t format,
@@ -450,6 +466,7 @@ class Renderer {
   uint64_t pass_ps_hash_ = 0, pass_vs_hash_ = 0;
   // Per-frame breakdown, reported for frames that miss 25 ms.
   double frame_idle_s_ = 0, frame_wait_s_ = 0, frame_texture_s_ = 0, frame_draw_s_ = 0;
+  double frame_texture_decode_s_ = 0, frame_texture_stage_s_ = 0;
   uint32_t frame_textures_ = 0, frame_pipeline_builds_ = 0, spike_reports_ = 0;
   void ReadGpuStamps(uint32_t slot);
   VkQueryPool ts_pool_[kFramesInFlight] = {};
@@ -527,6 +544,13 @@ class Renderer {
     // Resolves that copied texels, and redundant ones skipped (same source contents,
     // same rectangle and parameters, destination region untouched since).
     uint32_t resolves_copied = 0, resolves_skipped = 0;
+    uint32_t resolves_full_overwrite = 0;
+    // Resolve clears: by the attachment load operation over the whole target or
+    // over a rectangle of it, or (fallback) by vkCmdClearAttachments.
+    uint32_t clears_full = 0, clears_partial = 0, clears_command = 0;
+    // Pipeline barrier commands: layout transitions, and passes that needed an
+    // attachment dependency without a layout change.
+    uint32_t barriers = 0, attachment_barriers = 0;
     uint64_t resolve_px_copied = 0, resolve_px_skipped = 0;
     uint64_t resolve_bytes_copied = 0, resolve_bytes_skipped = 0;  // source read + dest write
     // Copied resolves whose result was overwritten before anything sampled it.
@@ -534,6 +558,8 @@ class Renderer {
     uint64_t resolve_px_dead = 0, resolve_bytes_dead = 0;
     uint32_t textures_uploaded = 0, shaders_compiled = 0;
     uint64_t upload_bytes = 0, arena_bytes = 0, arena_draws = 0, chunk_vertex_draws = 0;
+    uint64_t constant_words = 0, constant_words_changed = 0;
+    uint32_t constant_uploads = 0, constant_reuses = 0;
     uint32_t evicted = 0, throttled = 0;
     double draw_s = 0, resolve_s = 0, swap_s = 0, fence_s = 0, worst_ms = 0;
     double gpu_total_s = 0, gpu_tag_s[5] = {};
@@ -550,6 +576,10 @@ class Renderer {
   }
   // Frame tracing (carbon_gpu_trace_frame): logs every pass, draw and resolve.
   bool tracing_ = false;
+  // carbon_gpu_profile: CPU draw/resolve timers, GPU timestamps and breakdowns.
+  bool profile_ = false;
+  // carbon_gpu_clear_load_op: resolve clears use the attachment load operation.
+  bool clear_load_op_ = true;
   uint64_t stats_frames_ = 0;
   double stats_start_ = 0.0;
   // Frame pacing for the Android fps overlay (rex_gpu_report_fps), every 0.5 s.
@@ -564,6 +594,7 @@ class Renderer {
     uint64_t px = 0;
   };
   std::unordered_map<uint64_t, DestAgg> dest_agg_;
+  std::unordered_map<std::string, uint32_t> partial_clear_agg_;  // profiling: shapes of partial clears
   bool skip_redundant_resolves_ = true;
   // Frame and GPU times of the current stats window, for percentiles.
   std::vector<float> frame_ms_hist_, gpu_ms_hist_;

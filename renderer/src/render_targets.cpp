@@ -387,12 +387,16 @@ VkPipeline Renderer::GetResolvePipeline(VkFormat dest_format, bool depth_source)
 
 void Renderer::Resolve(const RegisterFile& regs) {
   struct Timer {
-    double& total;
-    double start = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    double* total;  // null unless profiling
+    double start = total ? std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count()
+                         : 0.0;
     ~Timer() {
-      total += std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - start;
+      if (total) {
+        *total += std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() - start;
+      }
     }
-  } resolve_timer{stats_.resolve_s};
+  } resolve_timer{profile_ ? &stats_.resolve_s : nullptr};
   using namespace rex::graphics;
   if (!BeginFrame()) {
     return;
@@ -596,7 +600,12 @@ void Renderer::Resolve(const RegisterFile& regs) {
         VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         att.imageView = dest_view;
         att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        // The resolve triangle writes all channels without blending or discard.
+        // Partial copies (including atlas row offsets) must retain other texels.
+        bool full_overwrite = dx0 == 0 && dy0 == 0 && dx1 == int32_t(dest->width) &&
+                              dy1 == int32_t(dest->height);
+        att.loadOp = full_overwrite ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
+        stats_.resolves_full_overwrite += full_overwrite;
         att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.renderArea = {{0, 0}, {dest->width, dest->height}};
@@ -660,7 +669,7 @@ void Renderer::Resolve(const RegisterFile& regs) {
         sigs.push_back(sig);
         if (sigs.size() > 8) sigs.erase(sigs.begin());
         ++stats_.resolves_copied;
-        {
+        if (profile_) {
           uint64_t key = (uint64_t(dest->guest.base_address) << 8) ^ (uint64_t(dest->width) << 40) ^
                          (uint64_t(dy0) << 24) ^ uint64_t(src->pitch) ^ (uint64_t(is_depth) << 3);
           DestAgg& d = dest_agg_[key];
@@ -691,16 +700,37 @@ void Renderer::Resolve(const RegisterFile& regs) {
     }
     pass.width = rt->lw;
     pass.height = rt->lh;
-    BeginRendering(pass);
     int32_t cx0 = int32_t(std::floor(x0 * res_scale_));
     int32_t cy0 = int32_t(std::floor(y0 * res_scale_));
     int32_t cx1 = std::min<int32_t>(int32_t(std::ceil(x1 * res_scale_)), int32_t(rt->width));
     int32_t cy1 = std::min<int32_t>(int32_t(std::ceil(y1 * res_scale_)), int32_t(rt->height));
-    if (cx1 > cx0 && cy1 > cy0) {
-      VkClearRect rect = {{{cx0, cy0}, {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0)}}, 0, 1};
-      dfn.vkCmdClearAttachments(frame().cb, 1, &clear, 1, &rect);
-      rt->write_gen = ++rt_write_counter_;
+    if (cx1 <= cx0 || cy1 <= cy0) {
+      return;  // Nothing to clear; the contents stay as they are.
     }
+    const VkRect2D area = {{cx0, cy0}, {uint32_t(cx1 - cx0), uint32_t(cy1 - cy0)}};
+    const bool full = cx0 == 0 && cy0 == 0 && cx1 == int32_t(rt->width) &&
+                      cy1 == int32_t(rt->height);
+    if (clear_load_op_) {
+      // The clear is the attachment's load operation over a render area equal to
+      // the clear rectangle: no old pixels are loaded, no separate clear command
+      // is recorded, and pixels outside the rectangle are not loaded or stored
+      // (oversized targets are often cleared only at the top).
+      BeginRendering(pass, &clear.clearValue, &area);
+      ++(full ? stats_.clears_full : stats_.clears_partial);
+    } else {
+      // Fallback: a pass over the whole image that loads it, then clears the rectangle.
+      BeginRendering(pass);
+      VkClearRect rect = {area, 0, 1};
+      dfn.vkCmdClearAttachments(frame().cb, 1, &clear, 1, &rect);
+      ++stats_.clears_command;
+    }
+    if (!full && profile_) {
+      char shape[96];
+      std::snprintf(shape, sizeof(shape), "%s %ux%u rect %d,%d-%d,%d", rt->is_depth ? "depth" : "color",
+                    rt->width, rt->height, cx0, cy0, cx1, cy1);
+      ++partial_clear_agg_[shape];
+    }
+    rt->write_gen = ++rt_write_counter_;
     EndRendering();
   };
   if (copy_control.depth_clear_enable) {

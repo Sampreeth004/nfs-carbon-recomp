@@ -9,6 +9,8 @@
 #include <optional>
 #include <string>
 
+#include "widescreen.h"
+
 #if defined(__ANDROID__)
 #include "android_aaudio.h"
 #include "thread_affinity.h"
@@ -151,6 +153,13 @@ class NfsCarbonApp : public rex::ReXApp {
 #if defined(__ANDROID__)
     // Guest threads keep being created after this; the watchdog rescans.
     thread_affinity_ = nfscarbon::afinidad::Arrancar();
+#endif
+  }
+
+  void OnPreLaunchModule() override {
+#if defined(__ANDROID__)
+    nfscarbon::ConfigureWidescreen(runtime()->memory()->virtual_membase(),
+        window()->GetActualPhysicalWidth(), window()->GetActualPhysicalHeight());
 #endif
   }
 

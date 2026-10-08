@@ -23,6 +23,7 @@ endif()
 set(NFSCARBON_SOURCES
     src/main.cpp
     src/dispatch_tolerance.cpp
+    src/widescreen.cpp
 )
 
 if(WIN32)
@@ -30,6 +31,7 @@ if(WIN32)
 endif()
 
 if(ANDROID)
+    list(APPEND NFSCARBON_SOURCES src/phone_hud.cpp)
     # JNI bridge for the on-screen touch gamepad overlay.
     list(APPEND NFSCARBON_SOURCES src/touch_bridge.cpp)
     # CPU core pinning watchdog for the command processor and main guest thread.

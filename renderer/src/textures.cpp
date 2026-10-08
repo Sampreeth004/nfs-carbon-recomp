@@ -216,11 +216,14 @@ void Renderer::UploadTexture(Texture& t) {
     base_offset = 0;
     DeferDestroy([this, buffer, allocation]() { vmaDestroyBuffer(allocator_, buffer, allocation); });
   }
+  const double decode_start = now();
+  frame_texture_stage_s_ += decode_start - start;
   if (t.format.conversion == TextureConversion::kUnsupported) {
     std::memset(dst, 0, size_t(size));
   } else {
     DecodeGuestTexture(physical_base_, t.guest, t.format, regions, dst);
   }
+  frame_texture_decode_s_ += now() - decode_start;
   std::vector<VkBufferImageCopy> copies;
   copies.reserve(regions.size());
   for (const HostTextureRegion& r : regions) {

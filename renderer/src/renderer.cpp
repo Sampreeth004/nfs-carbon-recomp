@@ -38,6 +38,16 @@ REXCVAR_DEFINE_INT32(carbon_gpu_upload_chunk_mb, 32, "CarbonGPU",
     .range(8, 256);
 REXCVAR_DEFINE_BOOL(carbon_gpu_stats, true, "CarbonGPU",
                     "Log renderer statistics (fps, draws, passes, uploads) every 5 seconds");
+REXCVAR_DEFINE_BOOL(carbon_gpu_profile, false, "CarbonGPU",
+                    "Detailed renderer profiling: CPU draw/resolve timers, GPU timestamp queries, "
+                    "per-pass and per-resolve-destination breakdowns and slow-frame reports "
+                    "(read at startup)");
+REXCVAR_DEFINE_BOOL(carbon_gpu_precise_barriers, true, "CarbonGPU",
+                    "Image barriers wait only for the stages and accesses that used the image "
+                    "(false = ALL_COMMANDS barriers on layout changes only)");
+REXCVAR_DEFINE_BOOL(carbon_gpu_clear_load_op, true, "CarbonGPU",
+                    "Clear render targets with the attachment load operation over the cleared "
+                    "rectangle (false = load the whole target and clear the rectangle)");
 REXCVAR_DEFINE_INT32(carbon_gpu_trace_frame, 0, "CarbonGPU",
                      "Log every pass, draw and resolve of this frame number (0 = off)");
 REXCVAR_DEFINE_INT32(carbon_gpu_dump_frame_interval, 0, "CarbonGPU",
@@ -247,6 +257,40 @@ double NowSeconds() {
 
 std::filesystem::path g_glsl_dump_dir;
 
+// How the renderer uses an image while it is in a layout.
+struct LayoutUse {
+  VkPipelineStageFlags stages;
+  VkAccessFlags reads;
+  VkAccessFlags writes;
+};
+
+LayoutUse LayoutUseOf(VkImageLayout layout) {
+  switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+      // New images only: nothing earlier to wait for.
+      return {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0};
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+      return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+      return {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+      // Guest textures can be fetched by vertex shaders as well as pixel shaders.
+      return {VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+              VK_ACCESS_SHADER_READ_BIT, 0};
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+      return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, 0};
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+      return {VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT};
+    default:
+      return {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT};
+  }
+}
+
 }  // namespace
 
 struct Renderer::PipelineKey {
@@ -307,6 +351,9 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
   fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
   reflection_faces_ = REXCVAR_GET(carbon_gpu_reflection_faces);
   mirror_half_rate_ = REXCVAR_GET(carbon_gpu_mirror_half_rate);
+  profile_ = REXCVAR_GET(carbon_gpu_profile);
+  clear_load_op_ = REXCVAR_GET(carbon_gpu_clear_load_op);
+  precise_barriers_ = REXCVAR_GET(carbon_gpu_precise_barriers);
   chunk_size_ = VkDeviceSize(REXCVAR_GET(carbon_gpu_upload_chunk_mb)) << 20;
   chunk_size_ = std::min<VkDeviceSize>(chunk_size_, props.maxStorageBufferRange);
 
@@ -397,7 +444,9 @@ bool Renderer::Initialize(GpuSystem* system, rex::ui::vulkan::VulkanProvider* pr
         ifn.vkGetDeviceProcAddr(vk_device_, "vkCmdWriteTimestamp"));
     pfn_get_query_results_ = reinterpret_cast<PFN_vkGetQueryPoolResults>(
         ifn.vkGetDeviceProcAddr(vk_device_, "vkGetQueryPoolResults"));
-    if (ts_period_ns_ > 0.0f && pfn_write_timestamp_ && pfn_get_query_results_) {
+    // Timestamp pools exist only while profiling; without them GpuStamp and
+    // ReadGpuStamps do nothing.
+    if (profile_ && ts_period_ns_ > 0.0f && pfn_write_timestamp_ && pfn_get_query_results_) {
       for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         VkQueryPoolCreateInfo qci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -804,17 +853,40 @@ void Renderer::TransitionImage(VkCommandBuffer cb, VkImage image, VkImageAspectF
   }
   const auto& dfn = vulkan_device_->functions();
   VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-  b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   b.oldLayout = layout;
   b.newLayout = new_layout;
   b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.image = image;
   b.subresourceRange = {aspect, 0, levels, 0, layers};
-  dfn.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+  VkPipelineStageFlags src_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  if (precise_barriers_) {
+    // Every image this renderer owns has one use per layout, so the layout names
+    // the stages and accesses on each side. Writes in the old layout are made
+    // available; reads in it only need the execution dependency (the layout
+    // transition then cannot overwrite data a reader still needs).
+    const LayoutUse src = LayoutUseOf(layout), dst = LayoutUseOf(new_layout);
+    src_stages = src.stages;
+    b.srcAccessMask = src.writes;
+    dst_stages = dst.stages;
+    b.dstAccessMask = dst.reads | dst.writes;
+  } else {
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  }
+  dfn.vkCmdPipelineBarrier(cb, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &b);
+  ++stats_.barriers;
   layout = new_layout;
+}
+
+void Renderer::TransitionImageConservative(VkCommandBuffer cb, VkImage image,
+                                           VkImageAspectFlags aspect, VkImageLayout& layout,
+                                           VkImageLayout new_layout) {
+  const bool precise = precise_barriers_;
+  precise_barriers_ = false;
+  TransitionImage(cb, image, aspect, layout, new_layout);
+  precise_barriers_ = precise;
 }
 
 // ---------------------------------------------------------------------------
@@ -826,21 +898,27 @@ void Renderer::EndRendering() {
     return;
   }
   vulkan_device_->functions().vkCmdEndRendering(frame().cb);
-  StampInfo info;
-  info.width = current_pass_.width;
-  info.height = current_pass_.height;
-  info.draws = pass_draws_;
-  info.ps_hash = pass_ps_hash_;
-  info.vs_hash = pass_vs_hash_;
-  info.depth = current_pass_.depth != nullptr;
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (current_pass_.color[i]) {
-      ++info.colors;
-      if (!info.format) info.format = uint32_t(current_pass_.color[i]->format);
+  for (RenderTarget* rt : current_pass_.color) {
+    if (rt) rt->attachment_written = true;
+  }
+  if (current_pass_.depth) current_pass_.depth->attachment_written = true;
+  if (ts_pool_[frame_index_]) {
+    StampInfo info;
+    info.width = current_pass_.width;
+    info.height = current_pass_.height;
+    info.draws = pass_draws_;
+    info.ps_hash = pass_ps_hash_;
+    info.vs_hash = pass_vs_hash_;
+    info.depth = current_pass_.depth != nullptr;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (current_pass_.color[i]) {
+        ++info.colors;
+        if (!info.format) info.format = uint32_t(current_pass_.color[i]->format);
+      }
     }
+    GpuStamp(current_pass_.depth ? kTagScenePass : kTagOtherPass, &info);
   }
   pass_draws_ = 0;
-  GpuStamp(current_pass_.depth ? kTagScenePass : kTagOtherPass, &info);
   rendering_ = false;
   current_pass_ = PassState();
 }
@@ -895,10 +973,34 @@ void Renderer::ReadGpuStamps(uint32_t slot) {
   }
 }
 
-bool Renderer::BeginRendering(const PassState& pass) {
+bool Renderer::BeginRendering(const PassState& pass, const VkClearValue* clear,
+                              const VkRect2D* clear_area) {
   cmd_ = CmdCache();
   const auto& dfn = vulkan_device_->functions();
   VkCommandBuffer cb = frame().cb;
+  // Attachments already in their attachment layout get no transition. If an
+  // earlier rendering pass wrote them, this pass's loads and writes still need a
+  // dependency on those writes; one barrier command covers all of them.
+  VkImageMemoryBarrier same_layout[5];
+  uint32_t same_layout_count = 0;
+  VkPipelineStageFlags same_layout_stages = 0;
+  auto attach = [&](RenderTarget* rt, VkImageAspectFlags aspect, VkImageLayout layout) {
+    if (rt->layout != layout) {
+      TransitionImage(cb, rt->image, aspect, rt->layout, layout);
+    } else if (rt->attachment_written && precise_barriers_) {
+      const LayoutUse use = LayoutUseOf(layout);
+      VkImageMemoryBarrier& b = same_layout[same_layout_count++];
+      b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      b.srcAccessMask = use.writes;
+      b.dstAccessMask = use.reads | use.writes;
+      b.oldLayout = b.newLayout = layout;
+      b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.image = rt->image;
+      b.subresourceRange = {aspect, 0, 1, 0, 1};
+      same_layout_stages |= use.stages;
+    }
+    rt->attachment_written = false;
+  };
   VkRenderingAttachmentInfo color[4] = {};
   for (uint32_t i = 0; i < 4; ++i) {
     color[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -907,9 +1009,12 @@ bool Renderer::BeginRendering(const PassState& pass) {
     color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (RenderTarget* rt = pass.color[i]) {
-      TransitionImage(cb, rt->image, VK_IMAGE_ASPECT_COLOR_BIT, rt->layout,
-                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      attach(rt, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
       color[i].imageView = rt->view;
+      if (clear && i == 0) {
+        color[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color[i].clearValue = *clear;
+      }
       rt->last_used_frame = frame_number_;
     }
   }
@@ -918,11 +1023,19 @@ bool Renderer::BeginRendering(const PassState& pass) {
   depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
   depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   if (pass.depth) {
-    TransitionImage(cb, pass.depth->image,
-                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, pass.depth->layout,
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    attach(pass.depth, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     depth.imageView = pass.depth->view;
+    if (clear && !pass.color[0]) {
+      depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      depth.clearValue = *clear;
+    }
     pass.depth->last_used_frame = frame_number_;
+  }
+  if (same_layout_count) {
+    dfn.vkCmdPipelineBarrier(cb, same_layout_stages, same_layout_stages, 0, 0, nullptr, 0,
+                             nullptr, same_layout_count, same_layout);
+    ++stats_.attachment_barriers;
   }
   VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
   uint32_t area_w = Scaled(pass.width), area_h = Scaled(pass.height);
@@ -937,6 +1050,11 @@ bool Renderer::BeginRendering(const PassState& pass) {
     area_h = std::min(area_h, pass.depth->height);
   }
   ri.renderArea = {{0, 0}, {area_w, area_h}};
+  if (clear_area) {
+    // Only this rectangle is cleared and stored; pixels outside the render area
+    // are not touched by the load and store operations.
+    ri.renderArea = *clear_area;
+  }
   ri.layerCount = 1;
   ri.colorAttachmentCount = 4;
   ri.pColorAttachments = color;
@@ -1720,16 +1838,18 @@ bool Renderer::SetupVertexData(const RegisterFile& regs, Shader* vs, DrawConstan
 }
 
 void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const DrawInfo& info) {
+  // One measurement feeds both the stats window and the slow-frame report.
   struct Timer {
-    double& total;
-    double start = NowSeconds();
-    ~Timer() { total += NowSeconds() - start; }
-  } draw_timer{stats_.draw_s};
-  struct FrameTimer {
-    double& total;
-    double start = NowSeconds();
-    ~FrameTimer() { total += NowSeconds() - start; }
-  } frame_draw_timer{frame_draw_s_};
+    Renderer* self;
+    double start = self->profile_ ? NowSeconds() : 0.0;
+    ~Timer() {
+      if (self->profile_) {
+        const double dt = NowSeconds() - start;
+        self->stats_.draw_s += dt;
+        self->frame_draw_s_ += dt;
+      }
+    }
+  } draw_timer{this};
   using namespace rex::graphics;
   if (!BeginFrame()) {
     return;
@@ -2302,9 +2422,11 @@ void Renderer::Draw(const RegisterFile& regs, Shader* vs, Shader* ps, const Draw
     if (!float_constants_dirty_[stage] && last_constant_chunk_[stage] == current_chunk_ &&
         last_constant_count_[stage] >= n) {
       dyn_offsets[stage] = uint32_t(last_constant_offset_[stage]);
+      ++stats_.constant_reuses;
       continue;
     }
     UploadAllocation a = Upload(4096, ubo_alignment_);
+    ++stats_.constant_uploads;
     if (n) {
       std::memcpy(a.ptr, &regs.values[kRegFloatConstants + stage * 1024], size_t(n) * 16);
     }
@@ -2610,8 +2732,9 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
   VkImageLayout dest_layout = dest_written_before
                                   ? rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout
                                   : VK_IMAGE_LAYOUT_UNDEFINED;
-  TransitionImage(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
-                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  // The presenter also uses this image, outside this renderer's tracking.
+  TransitionImageConservative(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
   VkRenderingAttachmentInfo att = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   att.imageView = dest_view;
   att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -2659,8 +2782,8 @@ void Renderer::RecordPresent(VkCommandBuffer cb, VkImageView source, uint32_t so
     dfn.vkCmdDraw(cb, 3, 1, 0, 0);
   }
   dfn.vkCmdEndRendering(cb);
-  TransitionImage(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
-                  rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+  TransitionImageConservative(cb, dest, VK_IMAGE_ASPECT_COLOR_BIT, dest_layout,
+                              rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
 }
 
 void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t width,
@@ -2675,6 +2798,10 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   // Re-read fps_cap_ each frame so runtime cvar changes take effect immediately.
   fps_cap_ = REXCVAR_GET(carbon_gpu_fps_cap);
   skip_redundant_resolves_ = REXCVAR_GET(carbon_gpu_skip_redundant_resolves);
+  if (frame_number_ == 1) {
+    REXGPU_INFO("[carbon-gpu] frame pacing: requested cap {}, additional host sleep {}",
+                fps_cap_, system_->NeedsHostFrameCap(fps_cap_) ? "enabled" : "disabled");
+  }
 
 #if defined(__ANDROID__)
   // Lazy ADPF init: called on the rendering thread so gettid() gives the
@@ -2820,9 +2947,9 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
   }
 #endif
 
-  // Frame rate cap: hold the command thread so the guest sees steady pacing and
-  // the SoC is not driven faster than needed.
-  if (fps_cap_ > 0) {
+  // Guest vblank already enforces its refresh rate. Add a host sleep only for a
+  // lower cap, or when guest vsync is disabled, to avoid two drifting 60 Hz clocks.
+  if (system_->NeedsHostFrameCap(fps_cap_)) {
     const double period = 1.0 / double(fps_cap_);
     double t = NowSeconds();
     if (cap_next_ == 0.0 || t - cap_next_ > period * 2.0) {
@@ -2832,22 +2959,26 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     if (t < cap_next_) {
       std::this_thread::sleep_for(std::chrono::duration<double>(cap_next_ - t));
     }
+  } else {
+    cap_next_ = 0.0;
   }
 
   // Statistics.
   ++stats_frames_;
   double now = NowSeconds();
-  if (overlay_last_swap_ > 0.0 && (now - overlay_last_swap_) * 1000.0 > 25.0 &&
+  if (profile_ && overlay_last_swap_ > 0.0 && (now - overlay_last_swap_) * 1000.0 > 25.0 &&
       REXCVAR_GET(carbon_gpu_stats) && spike_reports_ < 6) {
     ++spike_reports_;
     REXGPU_INFO(
         "[carbon-gpu] slow frame {:.1f} ms: draws {:.1f} ms, texture uploads {} ({:.1f} ms), "
-        "pipelines built inline {}, cp idle {:.1f} ms, cp WAIT_REG_MEM {:.1f} ms",
+        "pipelines built inline {}, cp idle {:.1f} ms, cp WAIT_REG_MEM {:.1f} ms | "
+        "texture decode {:.1f} ms, staging {:.1f} ms",
         (now - overlay_last_swap_) * 1000.0, frame_draw_s_ * 1000.0, frame_textures_,
         frame_texture_s_ * 1000.0, frame_pipeline_builds_, frame_idle_s_ * 1000.0,
-        frame_wait_s_ * 1000.0);
+        frame_wait_s_ * 1000.0, frame_texture_decode_s_ * 1000.0, frame_texture_stage_s_ * 1000.0);
   }
   frame_idle_s_ = frame_wait_s_ = frame_texture_s_ = frame_draw_s_ = 0;
+  frame_texture_decode_s_ = frame_texture_stage_s_ = 0;
   frame_textures_ = frame_pipeline_builds_ = 0;
   if (overlay_last_swap_ > 0.0) {
     double dt_ms = (now - overlay_last_swap_) * 1000.0;
@@ -2902,12 +3033,27 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
     }
     if (REXCVAR_GET(carbon_gpu_stats)) {
       double frames = double(std::max<uint64_t>(stats_frames_, 1));
+      // Draw and resolve CPU time are only measured while profiling.
+      std::string cpu_detail =
+          profile_ ? fmt::format("draw {:.2f}, resolve {:.2f}, ", stats_.draw_s * 1000.0 / frames,
+                                 stats_.resolve_s * 1000.0 / frames)
+                   : std::string();
       REXGPU_INFO(
           "[carbon-gpu] pacing(dbg mode {}): avg {:.1f} ms, worst {:.0f} ms, frames >25ms {} >34ms {} >50ms {} | "
-          "per frame ms: draw {:.2f}, resolve {:.2f}, swap {:.2f}, gpu fence wait {:.2f}",
+          "per frame ms: {}swap {:.2f}, gpu fence wait {:.2f}",
           debug_mode_, (now - stats_start_) * 1000.0 / frames, stats_.worst_ms, stats_.slow25, stats_.slow34,
-          stats_.slow50, stats_.draw_s * 1000.0 / frames, stats_.resolve_s * 1000.0 / frames,
-          stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
+          stats_.slow50, cpu_detail, stats_.swap_s * 1000.0 / frames, stats_.fence_s * 1000.0 / frames);
+      auto pct = [](std::vector<float>& v, double p) {
+        if (v.empty()) return 0.0f;
+        size_t k = std::min(v.size() - 1, size_t(p * double(v.size())));
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
+      };
+      if (!stats_.gpu_frames) {
+        REXGPU_INFO("[carbon-gpu] frame time ms p50/p95/p99 {:.1f}/{:.1f}/{:.1f}",
+                    pct(frame_ms_hist_, 0.50), pct(frame_ms_hist_, 0.95),
+                    pct(frame_ms_hist_, 0.99));
+      }
       if (stats_.gpu_frames) {
         std::vector<const PassAgg*> top;
         for (auto& kv : pass_agg_) top.push_back(&kv.second);
@@ -2926,12 +3072,6 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
         pass_agg_.clear();
         double g = double(stats_.gpu_frames);
         {
-          auto pct = [](std::vector<float>& v, double p) {
-            if (v.empty()) return 0.0f;
-            size_t k = std::min(v.size() - 1, size_t(p * double(v.size())));
-            std::nth_element(v.begin(), v.begin() + k, v.end());
-            return v[k];
-          };
           REXGPU_INFO(
               "[carbon-gpu] frame time ms p50/p95/p99 {:.1f}/{:.1f}/{:.1f} | gpu time ms "
               "p50/p95/p99 {:.1f}/{:.1f}/{:.1f}",
@@ -2959,6 +3099,28 @@ void Renderer::Swap(const RegisterFile& regs, uint32_t frontbuffer_ptr, uint32_t
           REXCVAR_GET(carbon_gpu_skip_redundant_resolves) ? "on" : "off",
           stats_.resolves_dead / f, double(stats_.resolve_px_dead) / f / 1e3,
           double(stats_.resolve_bytes_dead) / f / (1024.0 * 1024.0));
+      REXGPU_INFO(
+          "[carbon-gpu] constant writes per frame: {:.0f} dwords, {:.0f} unchanged | stage blocks "
+          "uploaded {:.1f}, reused {:.1f} | full-overwrite resolves {:.1f}",
+          double(stats_.constant_words) / f,
+          double(stats_.constant_words - stats_.constant_words_changed) / f,
+          stats_.constant_uploads / f, stats_.constant_reuses / f,
+          stats_.resolves_full_overwrite / f);
+      REXGPU_INFO("[carbon-gpu] clears per frame: {:.1f} full (load op), {:.1f} partial (load op), "
+                  "{:.1f} by clear command | barriers per frame: {:.1f} layout, {:.1f} attachment "
+                  "(precise {})",
+                  stats_.clears_full / f, stats_.clears_partial / f, stats_.clears_command / f,
+                  stats_.barriers / f, stats_.attachment_barriers / f,
+                  precise_barriers_ ? "on" : "off");
+      std::vector<std::pair<std::string, uint32_t>> shapes(partial_clear_agg_.begin(),
+                                                           partial_clear_agg_.end());
+      std::sort(shapes.begin(), shapes.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < shapes.size() && i < 6; ++i) {
+        REXGPU_INFO("[carbon-gpu]   partial clear {}: {:.2f}/frame", shapes[i].first,
+                    shapes[i].second / f);
+      }
+      partial_clear_agg_.clear();
     }
     if (REXCVAR_GET(carbon_gpu_stats) && !dest_agg_.empty()) {
       std::vector<const DestAgg*> top;

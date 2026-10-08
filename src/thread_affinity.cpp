@@ -1,7 +1,9 @@
 // Android thread affinity watchdog, ported from victorgbd/NFSMW-Recompiled-Mobile
-// (tools/afinidad.cpp). Pins the Xenos command processor and the guest main
-// thread to the prime cores and everything else to the rest, which the NFSMW
-// port measured at +17% fps in draw-heavy scenes on a Snapdragon 8 Elite.
+// (tools/afinidad.cpp). Pins the command processor and guest bootstrap thread
+// to prime cores. Carbon's MainThread may use all cores, including prime cores;
+// forcing it onto the remaining cores can delay frame production. Other threads
+// use the remaining cores. NFSMW's original policy measured +17% fps in
+// draw-heavy scenes on a Snapdragon 8 Elite; that is not a Carbon measurement.
 //
 // The SDK has per-thread masks, but nothing applies them on POSIX, and Android
 // rewrites the cpuset when the app goes to the background, so a small thread
@@ -181,6 +183,15 @@ std::vector<Rule> AutoRules() {
     rule.text = std::string(name) + "=" + CoresText(prime);
     rules.push_back(std::move(rule));
   }
+  // Carbon's frame-producing guest worker is named MainThread, separately from
+  // Main XThread. Let Android schedule it on prime cores when useful without
+  // forcing three busy threads to share the small prime-only mask.
+  Rule main_worker;
+  main_worker.prefix = "MainThread";
+  CPU_ZERO(&main_worker.cores);
+  for (int c = 0; c < count; ++c) CPU_SET(c, &main_worker.cores);
+  main_worker.text = "MainThread=" + CoresText(main_worker.cores);
+  rules.push_back(std::move(main_worker));
   Rule wildcard;
   wildcard.cores = rest;
   wildcard.text = "*=" + CoresText(rest);

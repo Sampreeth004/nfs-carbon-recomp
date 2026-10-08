@@ -12,6 +12,7 @@
 #include <aaudio/AAudio.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -70,7 +71,12 @@ class AAudioDriver final : public rex::audio::AudioDriver {
   size_t consumed_floats_ = 0;  // callback only
 
   float limiter_gain_ = 1.0f;  // producer only
-  uint64_t underruns_ = 0;     // callback only
+  // Callback only increments counters; formatting/file logging happens on
+  // the producer so a missed audio deadline cannot block the callback again.
+  std::atomic<uint64_t> underruns_{0};
+  std::atomic<uint64_t> missing_frames_{0};
+  uint64_t reported_underruns_ = 0;  // producer only
+  std::chrono::steady_clock::time_point next_diagnostic_{};
 };
 
 // Pauses or resumes the audio output (app sent to the background and back).

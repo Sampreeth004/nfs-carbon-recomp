@@ -22,6 +22,7 @@
 #include <unistd.h>
 #endif
 
+#include "constant_write.h"
 #include "gpu_system.h"
 #include "renderer.h"
 
@@ -573,6 +574,12 @@ bool CommandProcessor::ExecutePacket(Reader& r) {
 }
 
 void CommandProcessor::WriteRegistersFromReader(Reader& r, uint32_t base_index, uint32_t count) {
+  if (const uint32_t* data = r.Contiguous(count)) {
+    WriteRegistersFromGuest(base_index, data, count);
+    r.Skip(count);
+    return;
+  }
+  // A wrapping primary-ring packet keeps the scalar reader's wrap semantics.
   for (uint32_t i = 0; i < count; ++i) {
     WriteRegister(base_index + i, r.Read());
   }
@@ -580,8 +587,21 @@ void CommandProcessor::WriteRegistersFromReader(Reader& r, uint32_t base_index, 
 
 void CommandProcessor::WriteRegistersFromGuest(uint32_t base_index, const uint32_t* guest_be,
                                                uint32_t count) {
-  for (uint32_t i = 0; i < count; ++i) {
-    WriteRegister(base_index + i, ByteSwap32(guest_be[i]));
+  uint32_t i = 0;
+  while (i < count) {
+    uint32_t index = base_index + i;
+    if (index >= kRegFloatConstants && index < kRegFetchConstants) {
+      // Do not cross a VS/PS boundary: dirty only the stage whose bits changed.
+      uint32_t stage_end = kRegFloatConstants + (((index - kRegFloatConstants) >> 10) + 1) * 1024;
+      uint32_t n = std::min(count - i, stage_end - index);
+      uint32_t changed = WriteBigEndianConstants(&regs_.values[index], guest_be + i, n);
+      renderer_->OnFloatConstantsWritten(index - kRegFloatConstants, n, changed);
+      i += n;
+    } else {
+      // Scratch writeback, gamma and other guest-visible effects remain ordered.
+      WriteRegister(index, ByteSwap32(guest_be[i]));
+      ++i;
+    }
   }
 }
 
@@ -595,9 +615,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   }
   // Fast path for shader constants (the bulk of register traffic).
   if (index >= kRegFloatConstants) {
+    bool changed = regs_.values[index] != value;
     regs_.values[index] = value;
     if (index < kRegFetchConstants) {
-      renderer_->OnFloatConstantWritten(index - kRegFloatConstants);
+      renderer_->OnFloatConstantsWritten(index - kRegFloatConstants, 1, changed);
     }
     return;
   }
@@ -724,7 +745,7 @@ CommandProcessor::DebugState CommandProcessor::GetDebugState() const {
 bool CommandProcessor::ExecuteType3(Reader& r, uint32_t packet) {
   const uint32_t opcode = (packet >> 8) & 0x7F;
   dbg_last_opcode_.store(opcode, std::memory_order_relaxed);
-  dbg_packets_.fetch_add(1, std::memory_order_relaxed);
+  dbg_packets_.store(dbg_packets_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
   const uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   if (r.remaining() < count) {
     return false;
@@ -1084,7 +1105,7 @@ bool CommandProcessor::ExecuteDraw(Reader& r, uint32_t count_remaining) {
     }
   }
 
-  dbg_draws_.fetch_add(1, std::memory_order_relaxed);
+  dbg_draws_.store(dbg_draws_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
   auto viz = regs_.Get<reg::PA_SC_VIZ_QUERY>();
   if (viz.viz_query_ena && viz.kill_pix_post_hi_z) {
     return true;

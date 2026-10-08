@@ -1,0 +1,15 @@
+--- a/thirdparty/sdl3/src/events/SDL_events.c
++++ b/thirdparty/sdl3/src/events/SDL_events.c
+@@ -1733,7 +1733,11 @@
+ 
+ #ifdef SDL_PLATFORM_ANDROID
+     for (;;) {
+-        SDL_PumpEventsInternal(true);
++        // Carbon Android fix: a poll sentinel sends a lifecycle WAKE event.
++        // Creating one on every wait iteration wakes this thread itself and
++        // prevents Android_PumpEvents(delay) from sleeping. Blocking waits do
++        // not need a poll sentinel; SDL_PollEvent still creates its own above.
++        SDL_PumpEventsInternal(false);
+ 
+         if (SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
+             return true;

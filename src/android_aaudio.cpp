@@ -183,6 +183,18 @@ void AAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     std::memcpy(&ring_[0], block + first, (kBlockFloats - first) * sizeof(float));
   }
   write_.store(w + kBlockFloats, std::memory_order_release);
+
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= next_diagnostic_) {
+    next_diagnostic_ = now + std::chrono::seconds(5);
+    const uint64_t underruns = underruns_.load(std::memory_order_relaxed);
+    if (underruns != reported_underruns_) {
+      reported_underruns_ = underruns;
+      REXAPU_WARN("AAudio: {} underrun callbacks, {} missing frames total; queued {} frames",
+                  underruns, missing_frames_.load(std::memory_order_relaxed),
+                  (w + kBlockFloats - r) / 2);
+    }
+  }
 }
 
 aaudio_data_callback_result_t AAudioDriver::OnData(AAudioStream*, void* user, void* data,
@@ -204,10 +216,8 @@ aaudio_data_callback_result_t AAudioDriver::OnData(AAudioStream*, void* user, vo
   }
   if (take < need) {
     std::memset(out + take, 0, (need - take) * sizeof(float));
-    ++self->underruns_;
-    if (self->underruns_ <= 5 || self->underruns_ % 500 == 0) {
-      REXAPU_WARN("AAudio: underrun #{}", self->underruns_);
-    }
+    self->underruns_.fetch_add(1, std::memory_order_relaxed);
+    self->missing_frames_.fetch_add((need - take) / 2, std::memory_order_relaxed);
   }
   // One permit back to the audio worker per guest block played.
   self->consumed_floats_ += take;

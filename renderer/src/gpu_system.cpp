@@ -21,6 +21,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include "command_processor.h"
+#include "frame_pacing.h"
 #include "renderer.h"
 
 REXCVAR_DEFINE_BOOL(carbon_gpu_vsync, true, "CarbonGPU",
@@ -95,6 +96,10 @@ rex::X_STATUS GpuSystem::SetupGuestGpu(rex::runtime::FunctionDispatcher* functio
       reinterpret_cast<rex::runtime::MMIOReadCallback>(ReadRegisterThunk),
       reinterpret_cast<rex::runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
+  rex::system::X_VIDEO_MODE video_mode;
+  rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+  guest_refresh_hz_ = std::max(1.0, double(float(video_mode.refresh_rate)));
+  if (guest_refresh_hz_ < 20.0) guest_refresh_hz_ = 60.0;
   command_processor_->Start();
 
   vsync_running_ = true;
@@ -110,14 +115,13 @@ rex::X_STATUS GpuSystem::SetupGuestGpu(rex::runtime::FunctionDispatcher* functio
   return X_STATUS_SUCCESS;
 }
 
+bool GpuSystem::NeedsHostFrameCap(int32_t cap) const {
+  return carbon::gpu::NeedsHostFrameCap(cap, REXCVAR_GET(carbon_gpu_vsync), guest_refresh_hz_);
+}
+
 void GpuSystem::VsyncThreadMain() {
   REXGPU_INFO("[carbon-gpu] vsync thread started");
-  rex::system::X_VIDEO_MODE video_mode;
-  rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-  double refresh_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-  if (refresh_hz < 20.0) {
-    refresh_hz = 60.0;
-  }
+  const double refresh_hz = guest_refresh_hz_;
   REXGPU_INFO("[carbon-gpu] vsync at {:.2f} Hz", refresh_hz);
   using clock = std::chrono::steady_clock;
   auto next = clock::now();
