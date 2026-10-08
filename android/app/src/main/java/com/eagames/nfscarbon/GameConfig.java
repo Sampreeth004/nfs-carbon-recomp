@@ -43,10 +43,16 @@ public final class GameConfig {
     public static final String KEY_FXAA = "swap_post_effect";
     public static final String KEY_UPSCALER = "present_effect";
     public static final String KEY_LETTERBOX = "present_letterbox";
+    public static final String KEY_WIDESCREEN = "carbon_widescreen";
     public static final String KEY_OCCLUSION = "occlusion_query_enable";
     public static final String KEY_ANISO = "anisotropic_override";
     public static final String KEY_SINGLE_PASS = "nfsmw_una_pasada";
     public static final String KEY_FINE_PACING = "fine_frame_pacing";
+    // Native renderer switches (Advanced page).
+    public static final String KEY_PRECISE_BARRIERS = "precise_barriers";
+    public static final String KEY_CLEAR_LOAD_OP = "clear_load_op";
+    public static final String KEY_SKIP_RESOLVES = "skip_redundant_resolves";
+    public static final String KEY_GPU_PROFILE = "gpu_profile";
 
     public static final String KEY_ISO_PATH = "iso_path";
     public static final String KEY_ISO_LABEL = "iso_label";
@@ -72,7 +78,64 @@ public final class GameConfig {
     public static final float DEFAULT_SCALE = 1.0f;
     public static final float DEFAULT_DEADZONE = 0.08f;
 
+    // Performance presets: render scale %, fps cap, bloom, reflection faces,
+    // mirror half rate, anisotropy value.
+    public static final String[] PRESET_NAMES = {"Battery saver", "Balanced", "Quality"};
+    public static final String[] PRESET_HINTS = {
+            "30 fps · 75% resolution", "60 fps · recommended", "60 fps · bloom · 16x AF"
+    };
+    private static final int[][] PRESETS = {
+            {75, 30, 0, 0, 1, 0},
+            {100, 60, 0, 0, 1, 3},
+            {100, 60, 1, 0, 0, 5},
+    };
+
     private GameConfig() {
+    }
+
+    /** Index of the preset matching the current settings, or -1 for custom. */
+    public static int detectPreset(SharedPreferences p) {
+        int[] now = {
+                p.getInt(KEY_RENDER_SCALE, 100),
+                p.getInt(KEY_FPS_CAP, 60),
+                p.getBoolean(KEY_BLOOM, false) ? 1 : 0,
+                p.getInt(KEY_REFLECTIONS, 0),
+                p.getBoolean(KEY_MIRROR_HALF, true) ? 1 : 0,
+                p.getInt(KEY_ANISO, 3),
+        };
+        for (int i = 0; i < PRESETS.length; i++) {
+            if (java.util.Arrays.equals(now, PRESETS[i])) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public static void applyPreset(SharedPreferences p, int index) {
+        int[] v = PRESETS[index];
+        p.edit()
+                .putInt(KEY_RENDER_SCALE, v[0])
+                .putInt(KEY_FPS_CAP, v[1])
+                .putBoolean(KEY_BLOOM, v[2] != 0)
+                .putInt(KEY_REFLECTIONS, v[3])
+                .putBoolean(KEY_MIRROR_HALF, v[4] != 0)
+                .putInt(KEY_ANISO, v[5])
+                .apply();
+    }
+
+    /** Restores every setting to its default, keeping the game data and driver choice. */
+    public static void resetSettings(SharedPreferences p) {
+        String iso = p.getString(KEY_ISO_PATH, null);
+        String isoLabel = p.getString(KEY_ISO_LABEL, null);
+        String driver = p.getString(KEY_DRIVER_LOADER, null);
+        String driverLabel = p.getString(KEY_DRIVER_LABEL, null);
+        SharedPreferences.Editor e = p.edit().clear();
+        if (iso != null) e.putString(KEY_ISO_PATH, iso);
+        if (isoLabel != null) e.putString(KEY_ISO_LABEL, isoLabel);
+        if (driver != null) e.putString(KEY_DRIVER_LOADER, driver);
+        if (driverLabel != null) e.putString(KEY_DRIVER_LABEL, driverLabel);
+        e.putBoolean("reflections_off_migrated", true);
+        e.apply();
     }
 
     public static SharedPreferences prefs(Context context) {
@@ -103,6 +166,13 @@ public final class GameConfig {
         values.put(KEY_RENDERER, quote(p.getString(KEY_RENDERER, DEFAULT_RENDERER)));
         values.put(KEY_WIDTH, String.valueOf(guestWidth));
         values.put(KEY_HEIGHT, String.valueOf(guestHeight));
+        values.put(KEY_WIDESCREEN, bool(p.getBoolean(KEY_WIDESCREEN, true)));
+        // Fallback if SDL has not reported its drawable size when the guest starts.
+        android.util.DisplayMetrics screen = new android.util.DisplayMetrics();
+        ((android.view.WindowManager) context.getSystemService(Context.WINDOW_SERVICE))
+                .getDefaultDisplay().getRealMetrics(screen);
+        values.put("carbon_screen_width", String.valueOf(Math.max(screen.widthPixels, screen.heightPixels)));
+        values.put("carbon_screen_height", String.valueOf(Math.min(screen.widthPixels, screen.heightPixels)));
         values.put(KEY_VSYNC, bool(p.getBoolean(KEY_VSYNC, true)));
         values.put("carbon_gpu_bloom", bool(p.getBoolean(KEY_BLOOM, false)));
         values.put("achievement_toasts", "false");
@@ -111,6 +181,11 @@ public final class GameConfig {
         values.put("carbon_gpu_reflection_faces", String.valueOf(p.getInt(KEY_REFLECTIONS, 0)));
         values.put("carbon_gpu_mirror_half_rate", bool(p.getBoolean(KEY_MIRROR_HALF, true)));
         values.put("carbon_gpu_threaded_cp", bool(p.getBoolean(KEY_THREADED_CP, true)));
+        values.put("carbon_gpu_precise_barriers", bool(p.getBoolean(KEY_PRECISE_BARRIERS, true)));
+        values.put("carbon_gpu_clear_load_op", bool(p.getBoolean(KEY_CLEAR_LOAD_OP, true)));
+        values.put("carbon_gpu_skip_redundant_resolves",
+                bool(p.getBoolean(KEY_SKIP_RESOLVES, true)));
+        values.put("carbon_gpu_profile", bool(p.getBoolean(KEY_GPU_PROFILE, false)));
         // MSAA off by default: on Adreno the Xenos path is much faster at 1
         // sample. "native_2x_msaa" only gates the host's 2x attachment support.
         int msaaSamples = p.getInt(KEY_MSAA_SAMPLES, DEFAULT_MSAA_SAMPLES);
@@ -129,7 +204,9 @@ public final class GameConfig {
                 && p.getBoolean(KEY_SINGLE_PASS, true)));
         values.put(KEY_FXAA, quote(p.getString(KEY_FXAA, DEFAULT_FXAA)));
         values.put(KEY_UPSCALER, quote(p.getString(KEY_UPSCALER, DEFAULT_UPSCALER)));
-        values.put(KEY_LETTERBOX, bool(p.getBoolean(KEY_LETTERBOX, true)));
+        // Both display modes preserve proportions. A stale preference from
+        // the old Letterbox switch must not stretch the original 16:9 mode.
+        values.put(KEY_LETTERBOX, "true");
         values.put(KEY_OCCLUSION, bool(p.getBoolean(KEY_OCCLUSION, true)));
         values.put(KEY_ANISO, String.valueOf(p.getInt(KEY_ANISO, 3)));
         // A 120 Hz guest vblank grid lets late frames flip after 8.3 ms steps

@@ -6,32 +6,23 @@ import android.app.ProgressDialog;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.text.Editable;
 import android.text.InputType;
-import android.text.TextWatcher;
-import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.AdapterView;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
-import android.widget.Spinner;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -41,95 +32,58 @@ import java.util.List;
 import java.util.Locale;
 
 public class SettingsActivity extends Activity {
-    private static final int COLOR_TEXT = 0xFFE6EDF3;
-    private static final int COLOR_MUTED = 0xFF8B949E;
-    private static final int COLOR_ACCENT = 0xFF19C6E6;
-    private static final int COLOR_OK = 0xFF2ED47A;
-    private static final int COLOR_WARN = 0xFFFFB020;
-    private static final int COLOR_FIELD = 0xFF182233;
+    public static final String EXTRA_PAGE = "page";
 
-    private static final String[] ACTION_NAMES = {
-            "None", "A", "B", "X", "Y", "LB", "RB", "LT (analog)", "RT (analog)",
-            "Start", "Back", "L3", "R3", "Guide"
-    };
-    private static final int[] ACTION_BITS = {
-            0, 4096, 8192, 16384, 32768, 256, 512, 0, 0, 16, 32, 64, 128, 1024
-    };
-    private static final String[] ACTION_AXES = {
-            "", "", "", "", "", "", "", "lt", "rt", "", "", "", "", ""
-    };
+    public static final int PAGE_PERFORMANCE = 0;
+    public static final int PAGE_DISPLAY = 1;
+    public static final int PAGE_CONTROLS = 2;
+    public static final int PAGE_DRIVER = 3;
+    public static final int PAGE_GAME_DATA = 4;
+    public static final int PAGE_ADVANCED = 5;
+    public static final int PAGE_ABOUT = 6;
 
-    private static final String[] PAGES = {
-            "Graphics", "GPU driver", "Game data", "Controls", "About"
+    private static final String[] PAGE_NAMES = {
+            "Performance", "Display", "Controls", "GPU driver", "Game data", "Advanced", "About"
     };
-    private static final int PAGE_CONTROLS = 3;
-
-    // scale %, fps cap, bloom, reflection faces, mirror half rate, anisotropy value
-    private static final String[] PRESET_NAMES = {"Battery saver", "Balanced", "Quality"};
-    private static final String[] PRESET_HINTS = {
-            "30 fps, 75% resolution", "60 fps, recommended", "Bloom, 16x filtering"
+    private static final String[] PAGE_SUBTITLES = {
+            "Frame rate, resolution and effects. Lower settings run cooler.",
+            "Renderer, resolution and how the picture fits your screen.",
+            "On-screen touch controls. Controllers work without any setup.",
+            "Use the phone's Vulkan driver or an imported Adreno (turnip) driver.",
+            "Where the game is loaded from: your own ISO or an extracted folder.",
+            "Troubleshooting switches for the renderers. Defaults are best for most players.",
+            "Version and credits."
     };
-    private static final int[][] PRESETS = {
-            {75, 30, 0, 0, 1, 0},
-            {100, 60, 0, 0, 1, 3},
-            {100, 60, 1, 0, 0, 5},
+    private static final int[] PAGE_ICONS = {
+            Icons.GAUGE, Icons.DISPLAY, Icons.GAMEPAD, Icons.CHIP, Icons.DISC, Icons.TUNE,
+            Icons.INFO
     };
 
-    private LinearLayout container;
-    private LinearLayout current;
-    private LinearLayout tabs;
-    private ScrollView scroll;
     private SharedPreferences prefs;
     private TouchLayout touchLayout;
     private int page = 0;
-    private int rowsInCard = 0;
+    private boolean landscape;
 
-    private TextView isoValue;
+    private LinearLayout nav;
+    private ScrollView scroll;
+    private LinearLayout content;
+    private LinearLayout presetRow;
+
     private boolean pendingIsoScan = false;
-    private Uri pendingIsoUri;
-    private Uri pendingDriverUri;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_settings);
-        container = findViewById(R.id.settings_container);
-        tabs = findViewById(R.id.settings_tabs);
-        scroll = findViewById(R.id.settings_scroll);
         prefs = GameConfig.prefs(this);
         touchLayout = TouchLayout.load(this);
-
-        findViewById(R.id.settings_back).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                finish();
-            }
-        });
-
-        // Keep the cards a readable width on wide landscape screens.
-        int widthPx = getResources().getDisplayMetrics().widthPixels;
-        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) container.getLayoutParams();
-        lp.width = Math.min(widthPx, dp(780));
-        lp.gravity = Gravity.CENTER_HORIZONTAL;
-        container.setLayoutParams(lp);
-
-        boolean openControls = getIntent().getBooleanExtra(LauncherActivity.EXTRA_OPEN_CONTROLS,
-                false);
-        if (openControls) {
-            page = PAGE_CONTROLS;
-        } else if (savedInstanceState != null) {
-            page = savedInstanceState.getInt("page", 0);
+        landscape = getResources().getConfiguration().orientation
+                == Configuration.ORIENTATION_LANDSCAPE;
+        page = getIntent().getIntExtra(EXTRA_PAGE, PAGE_PERFORMANCE);
+        if (savedInstanceState != null) {
+            page = savedInstanceState.getInt("page", page);
         }
-        buildTabs();
+        setContentView(buildShell());
         showPage(page);
-        if (openControls) {
-            container.post(new Runnable() {
-                @Override
-                public void run() {
-                    openLayoutEditor();
-                }
-            });
-        }
     }
 
     @Override
@@ -139,86 +93,187 @@ public class SettingsActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // The controls editor saves its own copy of the layouts.
+        touchLayout = TouchLayout.load(this);
+        if (page == PAGE_CONTROLS && content != null) {
+            rebuild();
+        }
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         touchLayout.save(this);
         GameConfig.writeToml(this);
     }
 
-    // -------------------------------------------------------------------- Pages
+    // ------------------------------------------------------------------- Shell
 
-    private void buildTabs() {
-        tabs.removeAllViews();
-        for (int i = 0; i < PAGES.length; i++) {
-            final int index = i;
-            TextView chip = new TextView(this);
-            chip.setText(PAGES[i]);
-            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
-            chip.setGravity(Gravity.CENTER);
-            chip.setPadding(dp(18), dp(8), dp(18), dp(8));
-            chip.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View view) {
-                    showPage(index);
-                }
-            });
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            params.rightMargin = dp(8);
-            tabs.addView(chip, params);
+    private View buildShell() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(landscape ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        root.setBackground(new SpeedBackground());
+
+        // Navigation: a rail on the left in landscape, tabs on top in portrait.
+        LinearLayout side = Ui.vertical(this);
+        if (landscape) {
+            side.setPadding(dp(12), dp(14), dp(10), dp(14));
+            side.setBackgroundColor(0x66060A12);
+        } else {
+            side.setPadding(dp(12), dp(12), dp(12), 0);
         }
+        LinearLayout head = Ui.horizontal(this);
+        ImageView back = new ImageView(this);
+        back.setImageDrawable(new Icons(Icons.BACK, Ui.TEXT));
+        back.setPadding(dp(8), dp(8), dp(8), dp(8));
+        back.setBackground(Ui.ripple(Ui.rounded(this, Ui.SURFACE_2, 0x22FFFFFF, 12), 0x33FFFFFF));
+        back.setContentDescription("Back");
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                finish();
+            }
+        });
+        head.addView(back, new LinearLayout.LayoutParams(dp(40), dp(40)));
+        TextView title = Ui.text(this, "SETTINGS", 20f, Color.WHITE);
+        title.setTypeface(Ui.CONDENSED_ITALIC);
+        title.setLetterSpacing(0.08f);
+        LinearLayout.LayoutParams tp = Ui.wrap();
+        tp.leftMargin = dp(12);
+        head.addView(title, tp);
+        side.addView(head, Ui.matchWrap());
+
+        nav = new LinearLayout(this);
+        nav.setOrientation(landscape ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        for (int i = 0; i < PAGE_NAMES.length; i++) {
+            nav.addView(navItem(i));
+        }
+        if (landscape) {
+            ScrollView navScroll = new ScrollView(this);
+            navScroll.setVerticalScrollBarEnabled(false);
+            navScroll.addView(nav, Ui.matchWrap());
+            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+            np.topMargin = dp(14);
+            side.addView(navScroll, np);
+            TextView saved = Ui.text(this, "Changes save automatically and apply the next time "
+                    + "the game starts.", 11f, Ui.FAINT);
+            saved.setPadding(dp(4), dp(8), dp(4), 0);
+            side.addView(saved, Ui.matchWrap());
+            root.addView(side, new LinearLayout.LayoutParams(dp(218),
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+        } else {
+            HorizontalScrollView tabs = new HorizontalScrollView(this);
+            tabs.setHorizontalScrollBarEnabled(false);
+            tabs.addView(nav);
+            LinearLayout.LayoutParams np = Ui.matchWrap();
+            np.topMargin = dp(10);
+            side.addView(tabs, np);
+            root.addView(side, Ui.matchWrap());
+        }
+
+        scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        FrameLayout center = new FrameLayout(this);
+        content = Ui.vertical(this);
+        content.setPadding(dp(landscape ? 24 : 14), dp(16), dp(landscape ? 24 : 14), dp(32));
+        FrameLayout.LayoutParams cp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL);
+        int widthDp = (int) (getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density);
+        if (widthDp - (landscape ? 218 : 0) > 720) {
+            cp.width = dp(720);
+        }
+        center.addView(content, cp);
+        scroll.addView(center, Ui.matchWrap());
+        LinearLayout.LayoutParams sp = landscape
+                ? new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        root.addView(scroll, sp);
+        return root;
     }
 
-    private void updateTabs() {
-        for (int i = 0; i < tabs.getChildCount(); i++) {
-            TextView chip = (TextView) tabs.getChildAt(i);
-            boolean selected = i == page;
-            chip.setTextColor(selected ? Color.WHITE : COLOR_MUTED);
-            chip.setTypeface(null, selected ? Typeface.BOLD : Typeface.NORMAL);
-            if (selected) {
-                GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                        new int[]{0xFF12B5DB, 0xFF6A3DFF});
-                bg.setCornerRadius(dp(20));
-                chip.setBackground(bg);
-            } else {
-                chip.setBackground(rounded(0x33182233, 0x22FFFFFF, 20));
+    private View navItem(final int index) {
+        LinearLayout item = Ui.horizontal(this);
+        item.setPadding(dp(12), dp(10), dp(14), dp(10));
+        item.addView(Ui.icon(this, PAGE_ICONS[index], Ui.MUTED, 20));
+        TextView label = Ui.text(this, PAGE_NAMES[index], 14.5f, Ui.MUTED);
+        LinearLayout.LayoutParams lp = Ui.wrap();
+        lp.leftMargin = dp(12);
+        item.addView(label, lp);
+        item.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showPage(index);
             }
+        });
+        LinearLayout.LayoutParams p = landscape ? Ui.matchWrap() : Ui.wrap();
+        if (landscape) {
+            p.bottomMargin = dp(4);
+        } else {
+            p.rightMargin = dp(6);
+        }
+        item.setLayoutParams(p);
+        return item;
+    }
+
+    private void updateNav() {
+        for (int i = 0; i < nav.getChildCount(); i++) {
+            LinearLayout item = (LinearLayout) nav.getChildAt(i);
+            boolean on = i == page;
+            ((ImageView) item.getChildAt(0)).setImageDrawable(
+                    new Icons(PAGE_ICONS[i], on ? Ui.ACCENT : Ui.MUTED));
+            TextView label = (TextView) item.getChildAt(1);
+            label.setTextColor(on ? Color.WHITE : Ui.MUTED);
+            label.setTypeface(on ? Ui.MEDIUM : android.graphics.Typeface.DEFAULT);
+            item.setBackground(on ? Ui.rounded(this, 0x2619C6E6, 0x4019C6E6, 12)
+                    : Ui.ripple(null, 0x22FFFFFF));
         }
     }
 
     private void showPage(int index) {
-        page = index;
-        updateTabs();
-        populatePage();
+        page = Math.max(0, Math.min(PAGE_NAMES.length - 1, index));
+        updateNav();
+        rebuild();
         scroll.scrollTo(0, 0);
     }
 
-    private void populatePage() {
-        container.removeAllViews();
-        current = container;
-        rowsInCard = 0;
+    private void rebuild() {
+        final int y = scroll.getScrollY();
+        content.removeAllViews();
+        presetRow = null;
+        TextView heading = Ui.text(this, PAGE_NAMES[page], 26f, Color.WHITE);
+        heading.setTypeface(Ui.CONDENSED);
+        content.addView(heading, Ui.matchWrap());
+        TextView sub = Ui.text(this, PAGE_SUBTITLES[page], 13f, Ui.MUTED);
+        sub.setPadding(0, dp(2), 0, dp(4));
+        content.addView(sub, Ui.matchWrap());
         switch (page) {
-            case 0:
-                buildGraphics();
+            case PAGE_PERFORMANCE:
+                buildPerformance();
                 break;
-            case 1:
-                buildDriver();
-                break;
-            case 2:
-                buildGameData();
+            case PAGE_DISPLAY:
+                buildDisplay();
                 break;
             case PAGE_CONTROLS:
-                buildTouch();
+                buildControls();
+                break;
+            case PAGE_DRIVER:
+                buildDriver();
+                break;
+            case PAGE_GAME_DATA:
+                buildGameData();
+                break;
+            case PAGE_ADVANCED:
+                buildAdvanced();
                 break;
             default:
                 buildAbout();
                 break;
         }
-    }
-
-    private void rebuildUi() {
-        final int y = scroll.getScrollY();
-        populatePage();
         scroll.post(new Runnable() {
             @Override
             public void run() {
@@ -227,290 +282,601 @@ public class SettingsActivity extends Activity {
         });
     }
 
-    // ---------------------------------------------------------------- Graphics
+    /** Starts a titled group; returns the card that rows are added to. */
+    private LinearLayout group(String title) {
+        if (title != null) {
+            TextView t = Ui.overline(this, title);
+            t.setPadding(dp(4), dp(18), 0, dp(8));
+            content.addView(t, Ui.matchWrap());
+        }
+        LinearLayout card = Ui.card(this);
+        LinearLayout.LayoutParams p = Ui.matchWrap();
+        if (title == null) {
+            p.topMargin = dp(14);
+        }
+        content.addView(card, p);
+        return card;
+    }
 
-    private void buildGraphics() {
-        buildPresets();
+    private void gap(LinearLayout card) {
+        if (card.getChildCount() > 0) {
+            card.addView(Ui.divider(this));
+        }
+    }
 
-        // ---- Display
-        beginCard("Display", null);
-        final String[] rendererLabels = {
-                "Native Vulkan (default)", "Xenos emulation (fallback)"
-        };
-        final String[] rendererValues = {"carbon", "xenos"};
-        stringSpinner("Renderer",
-                "Native Vulkan is much faster. Xenos emulation is a slower compatibility "
-                        + "fallback.",
-                rendererLabels, rendererValues, GameConfig.KEY_RENDERER,
-                GameConfig.DEFAULT_RENDERER);
+    // ------------------------------------------------------------ Row helpers
 
+    private void bool(LinearLayout card, String title, String hint, final String key,
+                      boolean def) {
+        gap(card);
+        Ui.switchRow(this, card, title, hint, prefs.getBoolean(key, def),
+                new CompoundButton.OnCheckedChangeListener() {
+                    @Override
+                    public void onCheckedChanged(CompoundButton b, boolean checked) {
+                        prefs.edit().putBoolean(key, checked).apply();
+                        refreshPresets();
+                    }
+                });
+    }
+
+    private void ints(LinearLayout card, String title, String hint, String[] labels,
+                      final int[] values, final String key, int def) {
+        gap(card);
+        int stored = prefs.getInt(key, def);
+        int selected = -1;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] == stored) {
+                selected = i;
+            }
+        }
+        Ui.segmentedRow(this, card, title, hint, labels, selected, new Ui.IntChoice() {
+            @Override
+            public void onChoice(int index) {
+                prefs.edit().putInt(key, values[index]).apply();
+                refreshPresets();
+            }
+        });
+    }
+
+    private void strings(LinearLayout card, String title, String hint, String[] labels,
+                         final String[] values, final String key, String def,
+                         final Runnable after) {
+        gap(card);
+        String stored = prefs.getString(key, def);
+        int selected = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(stored)) {
+                selected = i;
+            }
+        }
+        Ui.segmentedRow(this, card, title, hint, labels, selected, new Ui.IntChoice() {
+            @Override
+            public void onChoice(int index) {
+                prefs.edit().putString(key, values[index]).apply();
+                if (after != null) {
+                    after.run();
+                }
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ Performance
+
+    private void buildPerformance() {
+        TextView t = Ui.overline(this, "Preset");
+        t.setPadding(dp(4), dp(18), 0, dp(8));
+        content.addView(t, Ui.matchWrap());
+        presetRow = Ui.horizontal(this);
+        presetRow.setGravity(Gravity.FILL_VERTICAL);
+        for (int i = 0; i < GameConfig.PRESET_NAMES.length; i++) {
+            final int index = i;
+            LinearLayout tile = Ui.vertical(this);
+            tile.setPadding(dp(14), dp(12), dp(14), dp(12));
+            tile.addView(Ui.title(this, GameConfig.PRESET_NAMES[i], 15f), Ui.matchWrap());
+            tile.addView(Ui.text(this, GameConfig.PRESET_HINTS[i], 12f, Ui.MUTED), Ui.matchWrap());
+            tile.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    GameConfig.applyPreset(prefs, index);
+                    rebuild();
+                    toast(GameConfig.PRESET_NAMES[index] + " applied");
+                }
+            });
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            p.rightMargin = i < GameConfig.PRESET_NAMES.length - 1 ? dp(10) : 0;
+            presetRow.addView(tile, p);
+        }
+        content.addView(presetRow, Ui.matchWrap());
+        refreshPresets();
+
+        LinearLayout card = group("Frame rate and resolution");
+        ints(card, "Frame rate cap", "Lower caps run cooler and steadier. The game is designed "
+                        + "for 30 or 60.",
+                new String[]{"30", "45", "60", "Unlimited"}, new int[]{30, 45, 60, 0},
+                GameConfig.KEY_FPS_CAP, 60);
+        ints(card, "Render resolution", "Size of the native renderer's images: 100% is "
+                        + "1280x720, 75% is 960x540. Lower is cooler and faster.",
+                new String[]{"50%", "60%", "75%", "85%", "100%"},
+                new int[]{50, 60, 75, 85, 100}, GameConfig.KEY_RENDER_SCALE, 100);
+
+        card = group("Effects");
+        bool(card, "Bloom and glow", "Heavy on phone GPUs: costs frame rate and heats the "
+                + "phone.", GameConfig.KEY_BLOOM, false);
+        ints(card, "Car reflections", "Not shown by the native renderer yet, so Off costs "
+                        + "nothing visible. Other values only add GPU work.",
+                new String[]{"Off", "1 face", "2 faces", "All 6"}, new int[]{0, 1, 2, 6},
+                GameConfig.KEY_REFLECTIONS, 0);
+        bool(card, "Rear-view mirror at half rate", "The mirror updates every other frame. "
+                + "Lighter, barely noticeable.", GameConfig.KEY_MIRROR_HALF, true);
+        ints(card, "Texture filtering", "Anisotropic filtering keeps road textures sharp at "
+                        + "angles.",
+                new String[]{"Off", "2x", "4x", "16x", "Game"}, new int[]{0, 2, 3, 5, -1},
+                GameConfig.KEY_ANISO, 3);
+    }
+
+    private void refreshPresets() {
+        if (presetRow == null) {
+            return;
+        }
+        int active = GameConfig.detectPreset(prefs);
+        for (int i = 0; i < presetRow.getChildCount(); i++) {
+            View tile = presetRow.getChildAt(i);
+            boolean on = i == active;
+            tile.setBackground(on
+                    ? Ui.ripple(Ui.rounded(this, 0x3319C6E6, Ui.ACCENT, 14), 0x33FFFFFF)
+                    : Ui.ripple(Ui.rounded(this, Ui.SURFACE, Ui.STROKE, 14), 0x33FFFFFF));
+        }
+    }
+
+    // ---------------------------------------------------------------- Display
+
+    private void buildDisplay() {
+        LinearLayout card = group("Renderer");
+        strings(card, "Renderer", "Native Vulkan is much faster. Xenos emulation is a slower "
+                        + "compatibility fallback; its options are under Advanced.",
+                new String[]{"Native Vulkan", "Xenos emulation"}, new String[]{"carbon", "xenos"},
+                GameConfig.KEY_RENDERER, GameConfig.DEFAULT_RENDERER, null);
+
+        card = group("Picture");
+        gap(card);
+        resolutionRow(card);
+        bool(card, "Widescreen", "Fills wide phone screens with a wider camera view and a "
+                + "proportional HUD. Off shows the original 16:9 view with black bars.",
+                GameConfig.KEY_WIDESCREEN, true);
+        bool(card, "Vertical sync", "Avoids tearing. Leave on.", GameConfig.KEY_VSYNC, true);
+        bool(card, "Fine frame pacing", "120 Hz timing with a 60 fps cap: late frames show "
+                + "sooner, so motion is smoother.", GameConfig.KEY_FINE_PACING, true);
+        bool(card, "Frame rate counter", "Shows fps and frame time at the top of the screen "
+                + "while playing.", GameConfig.KEY_SHOW_FPS, true);
+    }
+
+    private void resolutionRow(LinearLayout card) {
         int width = prefs.getInt(GameConfig.KEY_WIDTH, GameConfig.DEFAULT_WIDTH);
         int height = prefs.getInt(GameConfig.KEY_HEIGHT, GameConfig.DEFAULT_HEIGHT);
-        android.util.DisplayMetrics realMetrics = new android.util.DisplayMetrics();
-        getWindowManager().getDefaultDisplay().getRealMetrics(realMetrics);
-        final int nativeLong = Math.max(realMetrics.widthPixels, realMetrics.heightPixels);
-        final int nativeShort = Math.min(realMetrics.widthPixels, realMetrics.heightPixels);
-        final int[][] dimensions = {
+        android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(m);
+        final int nativeLong = Math.max(m.widthPixels, m.heightPixels);
+        final int nativeShort = Math.min(m.widthPixels, m.heightPixels);
+        final int[][] dims = {
                 {720, 480}, {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160},
                 {nativeLong, nativeShort}
         };
         final String[] labels = {
-                "480p (720x480, fastest)", "720p (1280x720)", "1080p (1920x1080)",
-                "1440p (2560x1440)", "4K (3840x2160)",
-                "Native (" + nativeLong + "x" + nativeShort + ")", "Custom"
+                "480p  ·  720x480", "720p  ·  1280x720 (recommended)", "1080p  ·  1920x1080",
+                "1440p  ·  2560x1440", "4K  ·  3840x2160",
+                "Native  ·  " + nativeLong + "x" + nativeShort, "Custom..."
         };
-        int selection = 4;
-        for (int i = 0; i < dimensions.length; i++) {
-            if (dimensions[i][0] == width && dimensions[i][1] == height) {
+        int selection = dims.length;
+        for (int i = 0; i < dims.length; i++) {
+            if (dims[i][0] == width && dims[i][1] == height) {
                 selection = i;
                 break;
             }
         }
-
-        final EditText customWidth = createEditText("Custom width", String.valueOf(width));
-        final EditText customHeight = createEditText("Custom height", String.valueOf(height));
-        customWidth.setVisibility(selection == 4 ? View.VISIBLE : View.GONE);
-        customHeight.setVisibility(selection == 4 ? View.VISIBLE : View.GONE);
-
-        spinnerRow("Guest resolution",
-                "Resolution the game thinks it renders at. Leave at 720p-class values unless "
-                        + "you know you need more.",
-                labels, selection,
-                new AdapterView.OnItemSelectedListener() {
+        final String[] shown = labels.clone();
+        shown[dims.length] = selection == dims.length ? "Custom  ·  " + width + "x" + height
+                : "Custom...";
+        final int[] selected = {selection};
+        Ui.pickerRow(this, card, "Game resolution",
+                "The resolution the game believes it renders at. 720p-class values suit phones.",
+                shown, selected, new Ui.IntChoice() {
                     @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        if (position < dimensions.length) {
-                            prefs.edit()
-                                    .putInt(GameConfig.KEY_WIDTH, dimensions[position][0])
-                                    .putInt(GameConfig.KEY_HEIGHT, dimensions[position][1])
-                                    .apply();
-                            customWidth.setText(String.valueOf(dimensions[position][0]));
-                            customHeight.setText(String.valueOf(dimensions[position][1]));
+                    public void onChoice(int index) {
+                        if (index < dims.length) {
+                            prefs.edit().putInt(GameConfig.KEY_WIDTH, dims[index][0])
+                                    .putInt(GameConfig.KEY_HEIGHT, dims[index][1]).apply();
+                        } else {
+                            customResolution();
                         }
-                        customWidth.setVisibility(position == dimensions.length
-                                ? View.VISIBLE : View.GONE);
-                        customHeight.setVisibility(position == dimensions.length
-                                ? View.VISIBLE : View.GONE);
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
                     }
                 });
-        addField(customWidth);
-        addField(customHeight);
-        customWidth.addTextChangedListener(new SimpleWatcher() {
+    }
+
+    private void customResolution() {
+        LinearLayout box = Ui.horizontal(this);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+        final EditText w = numberField(prefs.getInt(GameConfig.KEY_WIDTH, GameConfig.DEFAULT_WIDTH));
+        final EditText h = numberField(prefs.getInt(GameConfig.KEY_HEIGHT, GameConfig.DEFAULT_HEIGHT));
+        box.addView(w, Ui.weight(1));
+        TextView x = Ui.text(this, "  ×  ", 16f, Ui.MUTED);
+        box.addView(x, Ui.wrap());
+        box.addView(h, Ui.weight(1));
+        new AlertDialog.Builder(this, Ui.DIALOG_THEME)
+                .setTitle("Custom resolution")
+                .setMessage("Width 640-4095, height 480-4095.")
+                .setView(box)
+                .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        prefs.edit()
+                                .putInt(GameConfig.KEY_WIDTH, parseInt(w.getText().toString(),
+                                        GameConfig.DEFAULT_WIDTH, 640, 4095))
+                                .putInt(GameConfig.KEY_HEIGHT, parseInt(h.getText().toString(),
+                                        GameConfig.DEFAULT_HEIGHT, 480, 4095))
+                                .apply();
+                        rebuild();
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        rebuild();
+                    }
+                })
+                .show();
+    }
+
+    private EditText numberField(int value) {
+        EditText edit = new EditText(this);
+        edit.setText(String.valueOf(value));
+        edit.setTextColor(Ui.TEXT);
+        edit.setGravity(Gravity.CENTER);
+        edit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        edit.setSelectAllOnFocus(true);
+        return edit;
+    }
+
+    // --------------------------------------------------------------- Controls
+
+    private void buildControls() {
+        LinearLayout card = group(null);
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
+        TouchEditorView preview = new TouchEditorView(this);
+        preview.setPreview(true);
+        preview.setBackground(new SpeedBackground());
+        preview.setLayout(touchLayout, touchLayout.active);
+        preview.setClipToOutline(true);
+        preview.setOutlineProvider(new android.view.ViewOutlineProvider() {
             @Override
-            public void afterTextChanged(Editable s) {
-                int value = parseInt(s.toString(), GameConfig.DEFAULT_WIDTH, 640, 4095);
-                prefs.edit().putInt(GameConfig.KEY_WIDTH, value).apply();
+            public void getOutline(View view, android.graphics.Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(10));
             }
         });
-        customHeight.addTextChangedListener(new SimpleWatcher() {
+        preview.setOnClickListener(new View.OnClickListener() {
             @Override
-            public void afterTextChanged(Editable s) {
-                int value = parseInt(s.toString(), GameConfig.DEFAULT_HEIGHT, 480, 4095);
-                prefs.edit().putInt(GameConfig.KEY_HEIGHT, value).apply();
+            public void onClick(View v) {
+                openEditor();
             }
         });
-
-        intSpinner("Render resolution",
-                "Scales the native renderer's targets. Lower is cooler and faster.",
-                new String[]{"100% (1280x720, sharpest)", "85% (1088x612)",
-                        "75% (960x540, lighter)", "60% (768x432)", "50% (640x360, lightest)"},
-                new int[]{100, 85, 75, 60, 50}, GameConfig.KEY_RENDER_SCALE, 100);
-        intSpinner("Frame rate cap",
-                "Lower caps run cooler. The game is designed for 30 or 60.",
-                new String[]{"30 fps (coolest, steadiest)", "45 fps", "60 fps", "Unlimited"},
-                new int[]{30, 45, 60, 0}, GameConfig.KEY_FPS_CAP, 60);
-        switchRow("Vertical sync", null, GameConfig.KEY_VSYNC, true);
-        switchRow("Letterbox presentation", "Keep the game's aspect ratio with black bars.",
-                GameConfig.KEY_LETTERBOX, true);
-        switchRow("Fine frame pacing", "120 Hz timing with a 60 fps cap for smoother frames.",
-                GameConfig.KEY_FINE_PACING, true);
-        switchRow("Show FPS counter", "Overlay at the top of the screen while playing.",
-                GameConfig.KEY_SHOW_FPS, true);
-        switchRow("Threaded command processing",
-                "Reads the game's GPU commands on a separate thread so the game never waits "
-                        + "for ring space. Turn off if you see glitches.",
-                GameConfig.KEY_THREADED_CP, true);
-
-        // ---- Effects
-        beginCard("Effects and quality", null);
-        switchRow("Bloom / glow",
-                "Heavy: heats the phone and costs fps. Off by default on Android.",
-                GameConfig.KEY_BLOOM, false);
-        int reflStored = prefs.getInt(GameConfig.KEY_REFLECTIONS, 0);
-        intSpinnerAt("Car reflections",
-                "The native renderer does not show these yet, so Off costs nothing and saves "
-                        + "GPU work and heat. The other options only add work.",
-                new String[]{"Off (recommended)", "Full (6 faces per frame)",
-                        "Reduced (2 per frame)", "Minimal (1 per frame)"},
-                new int[]{0, 6, 2, 1}, GameConfig.KEY_REFLECTIONS,
-                reflStored <= 0 ? 0 : (reflStored >= 6 ? 1 : (reflStored >= 2 ? 2 : 3)));
-        switchRow("Rear-view mirror at half rate", "Lighter; the mirror updates every other frame.",
-                GameConfig.KEY_MIRROR_HALF, true);
-        intSpinner("Anisotropic filtering", "Sharper textures at angles.",
-                new String[]{"Force 4x (default)", "Off (fastest)", "2x", "16x", "No override"},
-                new int[]{3, 0, 2, 5, -1}, GameConfig.KEY_ANISO, 3);
-
-        // ---- Xenos only
-        beginCard("Xenos emulation only",
-                "These options only apply when the renderer is set to Xenos emulation.");
-        int msaa = prefs.getInt(GameConfig.KEY_MSAA_SAMPLES, GameConfig.DEFAULT_MSAA_SAMPLES);
-        intSpinnerAt("Anti-aliasing (MSAA)", null,
-                new String[]{"Off (fastest)", "MSAA 2x", "MSAA 4x (game default)"},
-                new int[]{0, 2, 4}, GameConfig.KEY_MSAA_SAMPLES,
-                msaa >= 4 ? 2 : (msaa >= 2 ? 1 : 0));
-        stringSpinner("Anti-aliasing (post effect)", null,
-                new String[]{"None", "FXAA", "FXAA Extreme"},
-                new String[]{"none", "fxaa", "fxaa_extreme"}, GameConfig.KEY_FXAA,
-                GameConfig.DEFAULT_FXAA);
-        switchRow("Single-pass scene", "Faster; requires MSAA off.", GameConfig.KEY_SINGLE_PASS,
-                true);
-        switchRow("Occlusion queries", "Sun flares and light glows.", GameConfig.KEY_OCCLUSION,
-                true);
-        label("Upscaler: bilinear (this SDK build has no FidelityFX support).");
-    }
-
-    private void buildPresets() {
-        beginCard("Performance preset",
-                "A quick starting point. Fine-tune the options below afterwards.");
-        final int active = detectPreset();
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        for (int i = 0; i < PRESETS.length; i++) {
-            final int index = i;
-            TextView chip = new TextView(this);
-            chip.setText(PRESET_NAMES[i] + "\n" + PRESET_HINTS[i]);
-            chip.setGravity(Gravity.CENTER);
-            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-            chip.setTextColor(i == active ? Color.WHITE : COLOR_MUTED);
-            chip.setTypeface(null, i == active ? Typeface.BOLD : Typeface.NORMAL);
-            chip.setPadding(dp(8), dp(12), dp(8), dp(12));
-            chip.setBackground(i == active
-                    ? rounded(0x3319C6E6, COLOR_ACCENT, 12)
-                    : rounded(COLOR_FIELD, 0x22FFFFFF, 12));
-            chip.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View view) {
-                    applyPreset(index);
-                    rebuildUi();
-                    toast(PRESET_NAMES[index] + " preset applied");
-                }
-            });
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            params.rightMargin = i < PRESETS.length - 1 ? dp(8) : 0;
-            row.addView(chip, params);
-        }
-        LinearLayout.LayoutParams rowParams = matchWrap();
-        rowParams.topMargin = dp(8);
-        current.addView(row, rowParams);
-        label(active < 0 ? "Current settings: custom" : "Current settings: "
-                + PRESET_NAMES[active]);
-    }
-
-    private int detectPreset() {
-        int[] now = {
-                prefs.getInt(GameConfig.KEY_RENDER_SCALE, 100),
-                prefs.getInt(GameConfig.KEY_FPS_CAP, 60),
-                prefs.getBoolean(GameConfig.KEY_BLOOM, false) ? 1 : 0,
-                prefs.getInt(GameConfig.KEY_REFLECTIONS, 0),
-                prefs.getBoolean(GameConfig.KEY_MIRROR_HALF, true) ? 1 : 0,
-                prefs.getInt(GameConfig.KEY_ANISO, 3),
-        };
-        for (int i = 0; i < PRESETS.length; i++) {
-            boolean same = true;
-            for (int j = 0; j < now.length; j++) {
-                if (now[j] != PRESETS[i][j]) {
-                    same = false;
-                    break;
-                }
+        card.addView(preview, Ui.matchWrap());
+        LinearLayout buttons = Ui.horizontal(this);
+        TextView edit = Ui.primaryButton(this, "Edit layout", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openEditor();
             }
-            if (same) {
-                return i;
+        });
+        buttons.addView(edit, Ui.weight(1));
+        TextView reset = Ui.secondaryButton(this, "Reset all", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirm("Reset touch controls?", "Both layouts, their size, opacity and "
+                        + "deadzone go back to the defaults.", "Reset", new Runnable() {
+                    @Override
+                    public void run() {
+                        touchLayout.resetFromDefaults(SettingsActivity.this);
+                        touchLayout.save(SettingsActivity.this);
+                        toast("Touch controls reset");
+                        rebuild();
+                    }
+                });
+            }
+        });
+        LinearLayout.LayoutParams rp = Ui.wrap();
+        rp.leftMargin = dp(10);
+        buttons.addView(reset, rp);
+        LinearLayout.LayoutParams bp = Ui.matchWrap();
+        bp.topMargin = dp(12);
+        card.addView(buttons, bp);
+
+        card = group("Overlay");
+        bool(card, "Touch controls", "Show the on-screen controls in game. A connected "
+                + "controller always works.", GameConfig.KEY_TOUCH_ENABLED, true);
+        gap(card);
+        Ui.segmentedRow(this, card, "Starting layout", "Switch any time in game with the "
+                        + "layout button in the top-left corner.",
+                new String[]{"Driving", "Gamepad"},
+                TouchLayout.LAYOUT_XBOX.equals(touchLayout.active) ? 1 : 0, new Ui.IntChoice() {
+                    @Override
+                    public void onChoice(int index) {
+                        touchLayout.active = index == 1 ? TouchLayout.LAYOUT_XBOX
+                                : TouchLayout.LAYOUT_DRIVING;
+                        touchLayout.save(SettingsActivity.this);
+                        rebuild();
+                    }
+                });
+        gap(card);
+        Ui.sliderRow(this, card, "Opacity", null, 0.1f, 1.0f, touchLayout.opacity, "%.0f%%",
+                100f, new Ui.FloatChoice() {
+                    @Override
+                    public void onValue(float value) {
+                        touchLayout.opacity = value;
+                    }
+                });
+        gap(card);
+        Ui.sliderRow(this, card, "Size", "Scales every control together.", 0.5f, 1.6f,
+                touchLayout.scale, "%.0f%%", 100f, new Ui.FloatChoice() {
+                    @Override
+                    public void onValue(float value) {
+                        touchLayout.scale = value;
+                    }
+                });
+        gap(card);
+        Ui.sliderRow(this, card, "Stick deadzone", "How far a stick moves before it "
+                        + "registers.", 0.0f, 0.3f, touchLayout.deadzone, "%.0f%%", 100f,
+                new Ui.FloatChoice() {
+                    @Override
+                    public void onValue(float value) {
+                        touchLayout.deadzone = value;
+                    }
+                });
+    }
+
+    private void openEditor() {
+        touchLayout.save(this);
+        startActivity(new Intent(this, ControlsEditorActivity.class));
+    }
+
+    // -------------------------------------------------------------- GPU driver
+
+    private static boolean isArm64() {
+        return Build.SUPPORTED_ABIS.length > 0 && "arm64-v8a".equals(Build.SUPPORTED_ABIS[0]);
+    }
+
+    private void buildDriver() {
+        final List<DriverStore.Driver> drivers = DriverStore.list(this);
+        String selectedPath = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
+        DriverStore.Driver active = null;
+        for (DriverStore.Driver driver : drivers) {
+            if (driver.loader.getAbsolutePath().equals(selectedPath)) {
+                active = driver;
             }
         }
-        return -1;
+
+        String detail;
+        int color;
+        if (active == null) {
+            detail = "The driver built into your phone. Always works.";
+            color = Ui.OK;
+        } else if (active.isFullLoader) {
+            detail = "Full Vulkan loader, loaded directly.";
+            color = Ui.ACCENT;
+        } else if (isArm64()) {
+            detail = "Adreno driver (turnip), loaded next to the system driver with "
+                    + "libadrenotools. Qualcomm Adreno GPUs only.";
+            color = Ui.ACCENT;
+        } else {
+            detail = "Adreno driver packages need a 64-bit ARM phone. The system driver will "
+                    + "be used instead.";
+            color = Ui.WARN;
+        }
+        LinearLayout card = group("In use");
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout hero = Ui.horizontal(this);
+        hero.addView(Ui.icon(this, Icons.CHIP, color, 34));
+        LinearLayout texts = Ui.vertical(this);
+        texts.setPadding(dp(14), 0, 0, 0);
+        texts.addView(Ui.title(this, active == null ? "System Vulkan driver" : active.label, 17f),
+                Ui.matchWrap());
+        TextView d = Ui.text(this, detail, 12.5f, Ui.MUTED);
+        texts.addView(d, Ui.matchWrap());
+        hero.addView(texts, Ui.weight(1));
+        card.addView(hero, Ui.matchWrap());
+        TextView phone = Ui.text(this, Build.MANUFACTURER + " " + Build.MODEL + "  ·  "
+                + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown ABI")
+                + "  ·  Android " + Build.VERSION.RELEASE, 11.5f, Ui.FAINT);
+        phone.setPadding(0, dp(10), 0, 0);
+        card.addView(phone, Ui.matchWrap());
+
+        card = group("Drivers");
+        driverRow(card, "System Vulkan driver", "Built into the phone", active == null,
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
+                        rebuild();
+                    }
+                }, null);
+        for (final DriverStore.Driver driver : drivers) {
+            driverRow(card, driver.label, driver.isFullLoader ? "Full Vulkan loader"
+                            : "Adreno driver (turnip)",
+                    active != null && driver.id.equals(active.id),
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER,
+                                    driver.loader.getAbsolutePath()).apply();
+                            rebuild();
+                        }
+                    },
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            confirmRemoveDriver(driver);
+                        }
+                    });
+        }
+
+        LinearLayout.LayoutParams ip = Ui.matchWrap();
+        ip.topMargin = dp(14);
+        content.addView(Ui.primaryButton(this, "Import driver (.zip or .so)",
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        intent.setType("*/*");
+                        try {
+                            startActivityForResult(intent, StorageUtil.REQUEST_PICK_DRIVER);
+                        } catch (Exception e) {
+                            toast("No document picker available");
+                        }
+                    }
+                }), ip);
+        TextView info = Ui.text(this, "Turnip packages are .zip files with a meta.json and a "
+                + "libvulkan_freedreno.so; a full libvulkan.so loader also works. The file is "
+                + "copied into app storage. If a driver cannot be opened the game falls back to "
+                + "the system driver (logged under the tag nfscarbon-driver).", 12f, Ui.MUTED);
+        info.setPadding(dp(4), dp(10), dp(4), 0);
+        content.addView(info, Ui.matchWrap());
     }
 
-    private void applyPreset(int index) {
-        int[] p = PRESETS[index];
-        prefs.edit()
-                .putInt(GameConfig.KEY_RENDER_SCALE, p[0])
-                .putInt(GameConfig.KEY_FPS_CAP, p[1])
-                .putBoolean(GameConfig.KEY_BLOOM, p[2] != 0)
-                .putInt(GameConfig.KEY_REFLECTIONS, p[3])
-                .putBoolean(GameConfig.KEY_MIRROR_HALF, p[4] != 0)
-                .putInt(GameConfig.KEY_ANISO, p[5])
-                .apply();
+    private void driverRow(LinearLayout card, String title, String subtitle, boolean selected,
+                           View.OnClickListener select, View.OnClickListener remove) {
+        gap(card);
+        LinearLayout row = Ui.horizontal(this);
+        row.setPadding(0, dp(12), 0, dp(12));
+        row.setOnClickListener(select);
+        row.setBackground(Ui.ripple(null, 0x22FFFFFF));
+        View radio = new View(this);
+        radio.setBackground(selected ? Ui.rounded(this, Ui.ACCENT, 0, 10)
+                : Ui.rounded(this, 0, 0x66FFFFFF, 10));
+        if (selected) {
+            ((android.graphics.drawable.GradientDrawable) radio.getBackground())
+                    .setStroke(dp(5), 0xFF0E2A35);
+        }
+        row.addView(radio, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        LinearLayout texts = Ui.labels(this, title, subtitle);
+        texts.setPadding(dp(14), 0, 0, 0);
+        row.addView(texts, Ui.weight(1));
+        if (selected) {
+            row.addView(Ui.badge(this, "In use", Ui.OK));
+        }
+        if (remove != null) {
+            ImageView trash = Ui.icon(this, Icons.TRASH, Ui.DANGER, 36);
+            trash.setPadding(dp(8), dp(8), dp(8), dp(8));
+            trash.setBackground(Ui.ripple(null, 0x33FF6B6B));
+            trash.setContentDescription("Remove");
+            trash.setOnClickListener(remove);
+            LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(dp(36), dp(36));
+            tp.leftMargin = dp(6);
+            row.addView(trash, tp);
+        }
+        card.addView(row, Ui.matchWrap());
+    }
+
+    private void confirmRemoveDriver(final DriverStore.Driver driver) {
+        confirm("Remove driver?", driver.label + " will be deleted from app storage.",
+                "Remove", new Runnable() {
+                    @Override
+                    public void run() {
+                        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
+                        DriverStore.remove(driver);
+                        if (driver.loader.getAbsolutePath().equals(selected)) {
+                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
+                        }
+                        rebuild();
+                        toast("Driver removed");
+                    }
+                });
     }
 
     // --------------------------------------------------------------- Game data
 
     private void buildGameData() {
-        beginCard("Game data", null);
-        isoValue = label("");
-        isoValue.setTextColor(COLOR_TEXT);
-        isoValue.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
-        updateIsoLabel();
+        boolean ready = GameConfig.isValidGameData(this);
+        String path = prefs.getString(GameConfig.KEY_ISO_PATH, "");
+        String name = prefs.getString(GameConfig.KEY_ISO_LABEL, "");
+        String titleText;
+        String detail;
+        if (path == null || path.isEmpty()) {
+            titleText = ready ? "Extracted game folder" : "No game data yet";
+            detail = ready ? "Found an extracted NFS folder in app storage."
+                    : "Pick your NFS Carbon ISO below to get started.";
+        } else {
+            File file = new File(path);
+            String size = file.isFile()
+                    ? String.format(Locale.US, "  ·  %.2f GB", file.length() / 1073741824.0) : "";
+            titleText = (name == null || name.isEmpty() ? file.getName() : name);
+            detail = path + size;
+        }
+        LinearLayout card = group("Current");
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout hero = Ui.horizontal(this);
+        hero.addView(Ui.icon(this, Icons.DISC, ready ? Ui.OK : Ui.WARN, 36));
+        LinearLayout texts = Ui.vertical(this);
+        texts.setPadding(dp(14), 0, 0, 0);
+        texts.addView(Ui.title(this, titleText, 17f), Ui.matchWrap());
+        texts.addView(Ui.text(this, detail, 12f, Ui.MUTED), Ui.matchWrap());
+        hero.addView(texts, Ui.weight(1));
+        hero.addView(Ui.badge(this, ready ? "Ready" : "Missing", ready ? Ui.OK : Ui.WARN));
+        card.addView(hero, Ui.matchWrap());
 
-        beginCard("Choose game data", "Copy mode is the safe default; direct paths skip the "
-                + "copy but some devices cannot memory-map large files from shared storage.");
-        primaryButton("Pick ISO file (copies into app storage)", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
-                intent.putExtra(Intent.EXTRA_MIME_TYPES,
-                        new String[]{"application/x-iso9660-image", "application/octet-stream"});
-                try {
-                    startActivityForResult(intent, StorageUtil.REQUEST_PICK_ISO);
-                } catch (Exception e) {
-                    toast("No document picker available");
-                }
-            }
-        });
+        TextView t = Ui.overline(this, "Choose game data");
+        t.setPadding(dp(4), dp(18), 0, dp(8));
+        content.addView(t, Ui.matchWrap());
+        content.addView(Ui.primaryButton(this, "Pick ISO file  (copied into the app)",
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View view) {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        intent.setType("*/*");
+                        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                                "application/x-iso9660-image", "application/octet-stream"});
+                        try {
+                            startActivityForResult(intent, StorageUtil.REQUEST_PICK_ISO);
+                        } catch (Exception e) {
+                            toast("No document picker available");
+                        }
+                    }
+                }), Ui.matchWrap());
+        TextView copyNote = Ui.text(this, "The safe choice. Needs free space for a copy of the "
+                + "ISO.", 12f, Ui.MUTED);
+        copyNote.setPadding(dp(4), dp(6), dp(4), dp(4));
+        content.addView(copyNote, Ui.matchWrap());
 
-        button("Scan device for ISOs (direct path, needs All files access)",
+        LinearLayout.LayoutParams sp = Ui.matchWrap();
+        sp.topMargin = dp(10);
+        content.addView(Ui.secondaryButton(this, "Find ISOs on this device  (use in place)",
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View view) {
                         scanForIsos();
                     }
-                });
+                }), sp);
+        TextView scanNote = Ui.text(this, "No copy, but needs All files access, and some phones "
+                + "cannot map large files from shared storage.", 12f, Ui.MUTED);
+        scanNote.setPadding(dp(4), dp(6), dp(4), dp(4));
+        content.addView(scanNote, Ui.matchWrap());
 
-        button("Clear game data selection", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                prefs.edit()
-                        .remove(GameConfig.KEY_ISO_PATH)
-                        .remove(GameConfig.KEY_ISO_LABEL)
-                        .apply();
-                updateIsoLabel();
-                toast("Cleared; the runtime will look for an extracted game folder");
-            }
-        });
-
-        label("A copied ISO lives at " + new File(getFilesDir(), "game.iso").getAbsolutePath()
-                + ".");
-    }
-
-    private void updateIsoLabel() {
-        String path = prefs.getString(GameConfig.KEY_ISO_PATH, "");
-        String name = prefs.getString(GameConfig.KEY_ISO_LABEL, "");
-        if (path == null || path.isEmpty()) {
-            isoValue.setText("Game data: not set (extracted game folder fallback)");
-            return;
+        if (path != null && !path.isEmpty()) {
+            LinearLayout.LayoutParams cp = Ui.matchWrap();
+            cp.topMargin = dp(10);
+            TextView clear = Ui.secondaryButton(this, "Forget this game data",
+                    new View.OnClickListener() {
+                        @Override
+                        public void onClick(View view) {
+                            prefs.edit().remove(GameConfig.KEY_ISO_PATH)
+                                    .remove(GameConfig.KEY_ISO_LABEL).apply();
+                            rebuild();
+                            toast("Cleared; the game will look for an extracted folder");
+                        }
+                    });
+            clear.setTextColor(Ui.DANGER);
+            content.addView(clear, cp);
         }
-        File file = new File(path);
-        String size = file.isFile()
-                ? String.format(Locale.US, " (%.2f GB)", file.length() / 1073741824.0) : "";
-        isoValue.setText("Game data: " + (name == null || name.isEmpty() ? path : name) + size
-                + "\n" + path);
     }
 
     private void scanForIsos() {
@@ -529,8 +895,8 @@ public class SettingsActivity extends Activity {
         for (int i = 0; i < isos.size(); i++) {
             names[i] = isos.get(i).getAbsolutePath();
         }
-        new AlertDialog.Builder(this)
-                .setTitle("Select ISO (direct path)")
+        new AlertDialog.Builder(this, Ui.DIALOG_THEME)
+                .setTitle("Use an ISO in place")
                 .setItems(names, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
@@ -539,8 +905,8 @@ public class SettingsActivity extends Activity {
                                 .putString(GameConfig.KEY_ISO_PATH, file.getAbsolutePath())
                                 .putString(GameConfig.KEY_ISO_LABEL, file.getName())
                                 .apply();
-                        updateIsoLabel();
-                        toast("Using ISO directly from shared storage");
+                        rebuild();
+                        toast("Using the ISO directly from shared storage");
                     }
                 })
                 .show();
@@ -549,14 +915,14 @@ public class SettingsActivity extends Activity {
     private void confirmIsoCopy(final Uri uri) {
         final String displayName = StorageUtil.displayName(this, uri);
         long size = StorageUtil.fileSize(this, uri);
-        String sizeText = size > 0
-                ? String.format(Locale.US, " (%.2f GB)", size / 1073741824.0) : "";
-        new AlertDialog.Builder(this)
-                .setTitle("Copy ISO into app storage?")
-                .setMessage(displayName + sizeText + "\n\nThe file will be stored at "
+        String sizeText = size > 0 ? String.format(Locale.US, " (%.2f GB)", size / 1073741824.0)
+                : "";
+        new AlertDialog.Builder(this, Ui.DIALOG_THEME)
+                .setTitle("Copy ISO into the app?")
+                .setMessage(displayName + sizeText + "\n\nIt will be stored at "
                         + new File(getFilesDir(), "game.iso").getAbsolutePath()
                         + ". Make sure there is enough free space.")
-                .setPositiveButton(android.R.string.ok, new DialogInterface.OnClickListener() {
+                .setPositiveButton("Copy", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         startIsoCopy(uri, displayName);
@@ -569,7 +935,7 @@ public class SettingsActivity extends Activity {
     private void startIsoCopy(final Uri uri, final String displayName) {
         final File destination = new File(getFilesDir(), "game.iso");
         final boolean[] cancelled = {false};
-        final ProgressDialog dialog = new ProgressDialog(this);
+        final ProgressDialog dialog = new ProgressDialog(this, Ui.DIALOG_THEME);
         dialog.setTitle("Copying ISO");
         dialog.setMessage(displayName);
         dialog.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
@@ -587,8 +953,8 @@ public class SettingsActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                boolean ok = StorageUtil.copyToFile(SettingsActivity.this, uri, destination,
-                        new StorageUtil.Progress() {
+                final boolean success = StorageUtil.copyToFile(SettingsActivity.this, uri,
+                        destination, new StorageUtil.Progress() {
                             @Override
                             public boolean onProgress(long copied, long total) {
                                 if (dialog.isShowing()) {
@@ -607,7 +973,6 @@ public class SettingsActivity extends Activity {
                                 return !cancelled[0];
                             }
                         });
-                final boolean success = ok;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -620,9 +985,9 @@ public class SettingsActivity extends Activity {
                                             destination.getAbsolutePath())
                                     .putString(GameConfig.KEY_ISO_LABEL, displayName)
                                     .apply();
-                            updateIsoLabel();
                             GameConfig.writeToml(SettingsActivity.this);
-                            toast("ISO copied");
+                            rebuild();
+                            toast("ISO copied. Ready to play.");
                         } else {
                             //noinspection ResultOfMethodCallIgnored
                             destination.delete();
@@ -634,783 +999,141 @@ public class SettingsActivity extends Activity {
         }).start();
     }
 
-    // -------------------------------------------------------------- GPU driver
+    // ---------------------------------------------------------------- Advanced
 
-    private static boolean isArm64() {
-        return Build.SUPPORTED_ABIS.length > 0 && "arm64-v8a".equals(Build.SUPPORTED_ABIS[0]);
-    }
+    private void buildAdvanced() {
+        LinearLayout card = group("Native renderer");
+        bool(card, "Threaded command processing", "Reads the game's GPU commands on a "
+                + "separate thread so the game never waits for ring space. Turn off if you "
+                + "see glitches.", GameConfig.KEY_THREADED_CP, true);
+        bool(card, "Precise GPU barriers", "GPU waits only for the work that used an image. "
+                + "Turn off if you see flickering or stale areas.",
+                GameConfig.KEY_PRECISE_BARRIERS, true);
+        bool(card, "Clear with load operations", "Clears only the area the game asks for. "
+                + "Turn off if you see garbage in mirrors, shadows or glow.",
+                GameConfig.KEY_CLEAR_LOAD_OP, true);
+        bool(card, "Skip redundant resolves", "Skips copies whose result is already in place.",
+                GameConfig.KEY_SKIP_RESOLVES, true);
+        bool(card, "Detailed profiling", "Logs per-draw CPU time, GPU timestamps and per-pass "
+                + "costs. Costs a little performance; for troubleshooting only.",
+                GameConfig.KEY_GPU_PROFILE, false);
 
-    private void buildDriver() {
-        final List<DriverStore.Driver> drivers = DriverStore.list(this);
-        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
-        DriverStore.Driver active = null;
-        for (DriverStore.Driver driver : drivers) {
-            if (driver.loader.getAbsolutePath().equals(selected)) {
-                active = driver;
-            }
+        boolean xenos = "xenos".equals(prefs.getString(GameConfig.KEY_RENDERER,
+                GameConfig.DEFAULT_RENDERER));
+        card = group("Xenos emulation");
+        if (!xenos) {
+            TextView note = Ui.text(this, "Only used when Display > Renderer is set to Xenos "
+                    + "emulation.", 12.5f, Ui.WARN);
+            note.setPadding(0, dp(10), 0, dp(4));
+            card.addView(note, Ui.matchWrap());
         }
-
-        // ---- Active driver status
-        beginCard("Active driver", null);
-        String name;
-        String detail;
-        int color;
-        if (active == null) {
-            name = "System Vulkan driver";
-            detail = "The driver built into your phone. Always works.";
-            color = COLOR_OK;
-        } else if (active.isFullLoader) {
-            name = active.label;
-            detail = "Full Vulkan loader, loaded directly.";
-            color = COLOR_ACCENT;
-        } else if (isArm64()) {
-            name = active.label;
-            detail = "Adreno driver (turnip), opened next to the system loader with "
-                    + "libadrenotools. Qualcomm Adreno GPUs only.";
-            color = COLOR_ACCENT;
-        } else {
-            name = active.label;
-            detail = "Adreno driver packages need a 64-bit ARM phone. The system driver will "
-                    + "be used instead.";
-            color = COLOR_WARN;
-        }
-        LinearLayout status = new LinearLayout(this);
-        status.setOrientation(LinearLayout.HORIZONTAL);
-        status.setGravity(Gravity.CENTER_VERTICAL);
-        View dot = new View(this);
-        GradientDrawable dotShape = new GradientDrawable();
-        dotShape.setShape(GradientDrawable.OVAL);
-        dotShape.setColor(color);
-        dot.setBackground(dotShape);
-        status.addView(dot, new LinearLayout.LayoutParams(dp(12), dp(12)));
-        TextView nameView = new TextView(this);
-        nameView.setText(name);
-        nameView.setTextColor(Color.WHITE);
-        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
-        nameView.setTypeface(null, Typeface.BOLD);
-        LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        nameParams.leftMargin = dp(10);
-        status.addView(nameView, nameParams);
-        LinearLayout.LayoutParams statusParams = matchWrap();
-        statusParams.topMargin = dp(8);
-        current.addView(status, statusParams);
-        label(detail);
-        label("This phone: " + Build.MODEL + "  |  " + (Build.SUPPORTED_ABIS.length > 0
-                ? Build.SUPPORTED_ABIS[0] : "unknown ABI") + "  |  Android "
-                + Build.VERSION.RELEASE);
-
-        // ---- Driver list
-        beginCard("Available drivers", "Tap a driver to use it. Changes apply the next time "
-                + "the game starts.");
-        driverRow("System Vulkan driver", "Built into the phone", active == null, null,
-                new View.OnClickListener() {
+        LinearLayout xenosRows = Ui.vertical(this);
+        int msaa = prefs.getInt(GameConfig.KEY_MSAA_SAMPLES, GameConfig.DEFAULT_MSAA_SAMPLES);
+        final int[] msaaValues = {0, 2, 4};
+        Ui.segmentedRow(this, xenosRows, "Anti-aliasing (MSAA)", null,
+                new String[]{"Off", "2x", "4x"}, msaa >= 4 ? 2 : (msaa >= 2 ? 1 : 0),
+                new Ui.IntChoice() {
                     @Override
-                    public void onClick(View view) {
-                        prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
-                        rebuildUi();
+                    public void onChoice(int index) {
+                        prefs.edit().putInt(GameConfig.KEY_MSAA_SAMPLES, msaaValues[index]).apply();
                     }
-                }, null);
-        for (final DriverStore.Driver driver : drivers) {
-            String kind = driver.isFullLoader ? "Full Vulkan loader" : "Adreno driver (turnip)";
-            driverRow(driver.label, kind, driver == active || (active != null
-                            && driver.id.equals(active.id)), driver,
-                    new View.OnClickListener() {
-                        @Override
-                        public void onClick(View view) {
-                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER,
-                                    driver.loader.getAbsolutePath()).apply();
-                            rebuildUi();
-                        }
-                    },
-                    new View.OnClickListener() {
-                        @Override
-                        public void onClick(View view) {
-                            confirmRemoveDriver(driver);
-                        }
-                    });
-        }
-        if (drivers.isEmpty()) {
-            label("No custom drivers imported yet.");
-        }
+                });
+        LinearLayout saved = card;
+        card = xenosRows;
+        strings(card, "Post-process anti-aliasing", null,
+                new String[]{"None", "FXAA", "FXAA Extreme"},
+                new String[]{"none", "fxaa", "fxaa_extreme"}, GameConfig.KEY_FXAA,
+                GameConfig.DEFAULT_FXAA, null);
+        bool(card, "Single-pass scene", "Faster; needs MSAA off and 720p or lower.",
+                GameConfig.KEY_SINGLE_PASS, true);
+        bool(card, "Occlusion queries", "Sun flares and light glows.", GameConfig.KEY_OCCLUSION,
+                true);
+        saved.addView(xenosRows, Ui.matchWrap());
+        Ui.setEnabledDeep(xenosRows, xenos);
 
-        // ---- Import
-        beginCard("Import a driver", "Download a turnip / Adreno driver .zip (the kind with a "
-                + "meta.json and a libvulkan_freedreno.so), or pick a full libvulkan.so loader. "
-                + "It is copied into app storage.");
-        primaryButton("Import driver (.zip or .so)", new View.OnClickListener() {
+        card = group("Reset");
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        card.addView(Ui.labels(this, "Restore default settings", "Every setting except your "
+                + "game data and GPU driver choice. Touch layouts are kept."), Ui.matchWrap());
+        TextView reset = Ui.secondaryButton(this, "Reset settings", new View.OnClickListener() {
             @Override
-            public void onClick(View view) {
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("*/*");
-                try {
-                    startActivityForResult(intent, StorageUtil.REQUEST_PICK_DRIVER);
-                } catch (Exception e) {
-                    toast("No document picker available");
-                }
+            public void onClick(View v) {
+                confirm("Reset all settings?", "Graphics, display and renderer settings go "
+                        + "back to their defaults.", "Reset", new Runnable() {
+                    @Override
+                    public void run() {
+                        GameConfig.resetSettings(prefs);
+                        rebuild();
+                        toast("Settings reset");
+                    }
+                });
             }
         });
-        label("If a custom driver cannot be opened the game falls back to the system driver. "
-                + "The reason is logged under the tag nfscarbon-driver.");
+        reset.setTextColor(Ui.DANGER);
+        LinearLayout.LayoutParams rp = Ui.matchWrap();
+        rp.topMargin = dp(12);
+        card.addView(reset, rp);
     }
 
-    private void driverRow(String title, String subtitle, boolean selected,
-                           DriverStore.Driver driver, View.OnClickListener select,
-                           View.OnClickListener remove) {
-        rowGap();
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(10), 0, dp(10));
-        row.setOnClickListener(select);
+    // ------------------------------------------------------------------ About
 
-        TextView radio = new TextView(this);
-        radio.setText(selected ? "●" : "○");
-        radio.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f);
-        radio.setTextColor(selected ? COLOR_ACCENT : COLOR_MUTED);
-        radio.setPadding(0, 0, dp(12), 0);
-        row.addView(radio, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        TextView titleView = new TextView(this);
-        titleView.setText(title);
-        titleView.setTextColor(COLOR_TEXT);
-        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        texts.addView(titleView, matchWrap());
-        TextView sub = new TextView(this);
-        sub.setText(subtitle);
-        sub.setTextColor(COLOR_MUTED);
-        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-        texts.addView(sub, matchWrap());
-        row.addView(texts, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        if (remove != null) {
-            TextView removeView = new TextView(this);
-            removeView.setText("Remove");
-            removeView.setTextColor(0xFFFF7B72);
-            removeView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-            removeView.setPadding(dp(12), dp(6), dp(4), dp(6));
-            removeView.setOnClickListener(remove);
-            row.addView(removeView, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+    private void buildAbout() {
+        String version = "";
+        try {
+            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception ignored) {
         }
-        current.addView(row, matchWrap());
+        LinearLayout card = group(null);
+        card.setPadding(dp(18), dp(16), dp(18), dp(16));
+        TextView nfs = Ui.text(this, "NEED FOR SPEED", 12f, Ui.ACCENT);
+        nfs.setTypeface(Ui.CONDENSED);
+        nfs.setLetterSpacing(0.3f);
+        card.addView(nfs, Ui.matchWrap());
+        TextView carbon = Ui.text(this, "CARBON", 34f, Color.WHITE);
+        carbon.setTypeface(Ui.CONDENSED_ITALIC);
+        card.addView(carbon, Ui.matchWrap());
+        card.addView(Ui.text(this, "Version " + version, 13f, Ui.MUTED), Ui.matchWrap());
+        TextView about = Ui.text(this, "The Xbox 360 game running natively on Android through "
+                + "static recompilation. Bring your own ISO or extracted game folder.", 13.5f,
+                Ui.TEXT);
+        about.setPadding(0, dp(12), 0, 0);
+        about.setLineSpacing(0, 1.15f);
+        card.addView(about, Ui.matchWrap());
+
+        card = group("Rendering");
+        card.setPadding(dp(16), dp(12), dp(16), dp(12));
+        card.addView(Ui.text(this, "Native Vulkan renderer (the carbon GPU plugin), written for "
+                + "this project. Xenos emulation (the xenos plugin) stays available as a "
+                + "fallback.", 13f, Ui.TEXT), Ui.matchWrap());
+
+        card = group("Credits");
+        card.setPadding(dp(16), dp(12), dp(16), dp(12));
+        card.addView(Ui.text(this, "ReXGlue SDK: recompilation runtime.", 13f, Ui.TEXT),
+                Ui.matchWrap());
+        TextView adreno = Ui.text(this, "libadrenotools by Billy Laws (BSD-2-Clause): loading "
+                + "downloaded Adreno / turnip drivers.", 13f, Ui.TEXT);
+        adreno.setPadding(0, dp(6), 0, 0);
+        card.addView(adreno, Ui.matchWrap());
     }
 
-    private void confirmRemoveDriver(final DriverStore.Driver driver) {
-        new AlertDialog.Builder(this)
-                .setTitle("Remove driver?")
-                .setMessage(driver.label + " will be deleted from app storage.")
-                .setPositiveButton("Remove", new DialogInterface.OnClickListener() {
+    // ----------------------------------------------------------------- Helpers
+
+    private void confirm(String title, String message, String action, final Runnable onYes) {
+        new AlertDialog.Builder(this, Ui.DIALOG_THEME)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton(action, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
-                        String selected = prefs.getString(GameConfig.KEY_DRIVER_LOADER, "");
-                        DriverStore.remove(driver);
-                        if (driver.loader.getAbsolutePath().equals(selected)) {
-                            prefs.edit().putString(GameConfig.KEY_DRIVER_LOADER, "").apply();
-                        }
-                        rebuildUi();
-                        toast("Driver removed");
+                        onYes.run();
                     }
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
     }
 
-    // ----------------------------------------------------------- Touch controls
-
-    private void buildTouch() {
-        section(R.string.touch_controls);
-        switchRow("Enable touch overlay", GameConfig.KEY_TOUCH_ENABLED, true);
-
-        String active = touchLayout.active;
-        final String[] layoutValues = {TouchLayout.LAYOUT_XBOX, TouchLayout.LAYOUT_DRIVING};
-        final String[] layoutNames = {"Xbox gamepad", "Driving"};
-        int layoutSelection = TouchLayout.LAYOUT_DRIVING.equals(active) ? 1 : 0;
-        spinnerRow("Default layout", layoutNames, layoutSelection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        touchLayout.active = layoutValues[position];
-                        touchLayout.save(SettingsActivity.this);
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-
-        seekRow("Overlay opacity", 0.1f, 1.0f, touchLayout.opacity,
-                new ValueListener() {
-                    @Override
-                    public void onValue(float value) {
-                        touchLayout.opacity = value;
-                    }
-                });
-        seekRow("Control scale", 0.5f, 1.6f, touchLayout.scale, new ValueListener() {
-            @Override
-            public void onValue(float value) {
-                touchLayout.scale = value;
-            }
-        });
-        seekRow("Stick deadzone", 0.0f, 0.3f, touchLayout.deadzone, new ValueListener() {
-            @Override
-            public void onValue(float value) {
-                touchLayout.deadzone = value;
-            }
-        });
-
-        button("Edit touch controls...", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                openLayoutEditor();
-            }
-        });
-        button("Reset layouts to defaults", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                touchLayout.resetFromDefaults(SettingsActivity.this);
-                touchLayout.save(SettingsActivity.this);
-                toast("Touch layouts reset");
-                rebuildUi();
-            }
-        });
-    }
-
-    private void openLayoutEditor() {
-        final LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        int padding = dp(16);
-        root.setPadding(padding, padding, padding, padding);
-
-        labelInto(root, "Drag a control to move it. Use the sliders to resize and remap.");
-
-        final String[] layoutValues = {TouchLayout.LAYOUT_XBOX, TouchLayout.LAYOUT_DRIVING};
-        final String[] layoutNames = {"Xbox gamepad", "Driving"};
-        final Spinner layoutPicker = new Spinner(this);
-        ArrayAdapter<String> layoutAdapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, layoutNames);
-        layoutAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        layoutPicker.setAdapter(layoutAdapter);
-        layoutPicker.setSelection(TouchLayout.LAYOUT_DRIVING.equals(touchLayout.active) ? 1 : 0);
-
-        final TouchEditorView editor = new TouchEditorView(this);
-        editor.setLayout(touchLayout, layoutValues[layoutPicker.getSelectedItemPosition()]);
-        editor.setMinimumHeight(dp(160));
-
-        final TextView sizeLabel = new TextView(this);
-        sizeLabel.setTextColor(COLOR_MUTED);
-        sizeLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        final SeekBar sizeBar = new SeekBar(this);
-        sizeBar.setMax(370);
-
-        final Spinner actionSpinner = new Spinner(this);
-        ArrayAdapter<String> actionAdapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, ACTION_NAMES);
-        actionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        actionSpinner.setAdapter(actionAdapter);
-
-        final boolean[] updating = {false};
-
-        editor.setListener(new TouchEditorView.Listener() {
-            @Override
-            public void onSelectionChanged(TouchLayout.Control control) {
-                updating[0] = true;
-                if (control != null) {
-                    sizeBar.setProgress(Math.round((control.size - 0.03f) * 1000f));
-                    sizeLabel.setText("Size: " + String.format(Locale.US, "%.3f", control.size));
-                    int actionIndex = 0;
-                    for (int i = 0; i < ACTION_NAMES.length; i++) {
-                        boolean bitMatch = ACTION_BITS[i] != 0 && control.bit == ACTION_BITS[i];
-                        boolean axisMatch = !ACTION_AXES[i].isEmpty()
-                                && ACTION_AXES[i].equals(control.axis);
-                        if (bitMatch || axisMatch
-                                || (i == 0 && control.bit == 0 && control.axis.isEmpty())) {
-                            actionIndex = i;
-                            break;
-                        }
-                    }
-                    actionSpinner.setSelection(actionIndex);
-                }
-                updating[0] = false;
-            }
-
-            @Override
-            public void onLayoutEdited() {
-                touchLayout.save(SettingsActivity.this);
-            }
-        });
-
-        sizeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (!fromUser) {
-                    return;
-                }
-                float size = 0.03f + progress / 1000f;
-                sizeLabel.setText("Size: " + String.format(Locale.US, "%.3f", size));
-                editor.setControlSize(size);
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {
-            }
-
-            @Override
-            public void onStopTrackingTouch(SeekBar seekBar) {
-            }
-        });
-
-        actionSpinner.post(new Runnable() {
-            @Override
-            public void run() {
-                actionSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        if (updating[0]) {
-                            return;
-                        }
-                        editor.setControlAction(ACTION_BITS[position], ACTION_AXES[position],
-                                ACTION_NAMES[position]);
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-            }
-        });
-
-        layoutPicker.post(new Runnable() {
-            @Override
-            public void run() {
-                layoutPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        editor.setLayout(touchLayout, layoutValues[position]);
-                        editor.invalidate();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-            }
-        });
-
-        Button reset = new Button(this);
-        reset.setText("Reset this layout");
-        reset.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                int position = layoutPicker.getSelectedItemPosition();
-                TouchLayout defaults = new TouchLayout();
-                defaults.fromJson(TouchLayout.defaultJson(SettingsActivity.this));
-                List<TouchLayout.Control> replacement = defaults.layouts.get(layoutValues[position]);
-                if (replacement != null) {
-                    List<TouchLayout.Control> copy = new ArrayList<>();
-                    for (TouchLayout.Control control : replacement) {
-                        copy.add(control.copy());
-                    }
-                    touchLayout.layouts.put(layoutValues[position], copy);
-                    touchLayout.save(SettingsActivity.this);
-                    editor.setLayout(touchLayout, layoutValues[position]);
-                }
-            }
-        });
-
-        root.addView(layoutPicker, matchWrap());
-        root.addView(editor, matchWrap());
-        root.addView(sizeLabel, matchWrap());
-        root.addView(sizeBar, matchWrap());
-        labelInto(root, "Action");
-        root.addView(actionSpinner, matchWrap());
-        root.addView(reset, matchWrap());
-
-        new AlertDialog.Builder(this)
-                .setTitle("Touch layout editor")
-                .setView(root)
-                .setPositiveButton("Done", new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        touchLayout.save(SettingsActivity.this);
-                        rebuildUi();
-                    }
-                })
-                .show();
-    }
-
-    // -------------------------------------------------------------------- About
-
-    private void buildAbout() {
-        beginCard("NFS Carbon", null);
-        String version = "";
-        try {
-            version = "Version " + getPackageManager().getPackageInfo(getPackageName(), 0)
-                    .versionName;
-        } catch (Exception ignored) {
-        }
-        label(version);
-        label("Need for Speed: Carbon (Xbox 360) running natively on Android through a static "
-                + "recompilation. Game data: your own ISO or extracted game folder.");
-        beginCard("Rendering", null);
-        label("Native Vulkan renderer (the carbon GPU plugin), written for this project. Xenos "
-                + "emulation (the xenos plugin) stays available as a fallback.");
-        beginCard("Credits", null);
-        label("ReXGlue SDK: recompilation runtime.");
-        label("libadrenotools by Billy Laws (BSD-2-Clause): loading downloaded Adreno / turnip "
-                + "drivers.");
-    }
-
-    // ------------------------------------------------------------------ Helpers
-
-    private interface ValueListener {
-        void onValue(float value);
-    }
-
-    private abstract static class SimpleWatcher implements TextWatcher {
-        @Override
-        public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-        }
-
-        @Override
-        public void onTextChanged(CharSequence s, int start, int before, int count) {
-        }
-    }
-
-    private GradientDrawable rounded(int fill, int stroke, int radiusDp) {
-        GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(fill);
-        drawable.setStroke(dp(1), stroke);
-        drawable.setCornerRadius(dp(radiusDp));
-        return drawable;
-    }
-
-    private void section(int titleRes) {
-        beginCard(getString(titleRes), null);
-    }
-
-    private void beginCard(String title, String hint) {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackgroundResource(R.drawable.bg_card);
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
-        LinearLayout.LayoutParams params = matchWrap();
-        params.topMargin = dp(12);
-        container.addView(card, params);
-        current = card;
-        rowsInCard = 0;
-        if (title != null) {
-            TextView view = new TextView(this);
-            view.setText(title.toUpperCase(Locale.US));
-            view.setTextColor(COLOR_ACCENT);
-            view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-            view.setTypeface(null, Typeface.BOLD);
-            view.setLetterSpacing(0.1f);
-            card.addView(view, matchWrap());
-        }
-        if (hint != null) {
-            label(hint);
-        }
-    }
-
-    private void rowGap() {
-        if (rowsInCard++ > 0) {
-            View divider = new View(this);
-            divider.setBackgroundColor(0x1AFFFFFF);
-            current.addView(divider, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, 1));
-        }
-    }
-
-    private TextView label(String text) {
-        return labelInto(current, text);
-    }
-
-    private TextView labelInto(LinearLayout parent, String text) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextColor(COLOR_MUTED);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        view.setPadding(0, dp(4), 0, dp(4));
-        parent.addView(view, matchWrap());
-        return view;
-    }
-
-    private Switch switchRow(String title, final String key, boolean defaultValue) {
-        return switchRow(title, null, key, defaultValue);
-    }
-
-    private Switch switchRow(String title, String hint, final String key,
-                             boolean defaultValue) {
-        rowGap();
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(10), 0, dp(10));
-
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        TextView titleView = new TextView(this);
-        titleView.setText(title);
-        titleView.setTextColor(COLOR_TEXT);
-        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        texts.addView(titleView, matchWrap());
-        if (hint != null) {
-            TextView hintView = new TextView(this);
-            hintView.setText(hint);
-            hintView.setTextColor(COLOR_MUTED);
-            hintView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-            texts.addView(hintView, matchWrap());
-        }
-        row.addView(texts, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        final Switch toggle = new Switch(this);
-        int[][] states = {{android.R.attr.state_checked}, {}};
-        toggle.setThumbTintList(new ColorStateList(states,
-                new int[]{COLOR_ACCENT, 0xFFB0B8C2}));
-        toggle.setTrackTintList(new ColorStateList(states,
-                new int[]{0x6619C6E6, 0x44FFFFFF}));
-        toggle.setChecked(prefs.getBoolean(key, defaultValue));
-        toggle.setOnCheckedChangeListener(
-                new android.widget.CompoundButton.OnCheckedChangeListener() {
-                    @Override
-                    public void onCheckedChanged(android.widget.CompoundButton buttonView,
-                                                 boolean isChecked) {
-                        prefs.edit().putBoolean(key, isChecked).apply();
-                    }
-                });
-        row.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                toggle.toggle();
-            }
-        });
-        row.addView(toggle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        current.addView(row, matchWrap());
-        return toggle;
-    }
-
-    private ArrayAdapter<String> styledAdapter(String[] items) {
-        return new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
-            @Override
-            public View getView(int position, View convertView, ViewGroup parent) {
-                return tint(super.getView(position, convertView, parent), false);
-            }
-
-            @Override
-            public View getDropDownView(int position, View convertView, ViewGroup parent) {
-                return tint(super.getDropDownView(position, convertView, parent), true);
-            }
-        };
-    }
-
-    private View tint(View view, boolean dropDown) {
-        if (view instanceof TextView) {
-            TextView text = (TextView) view;
-            text.setTextColor(COLOR_TEXT);
-            text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-            text.setPadding(dp(12), dp(12), dp(12), dp(12));
-            if (dropDown) {
-                text.setBackgroundColor(COLOR_FIELD);
-            }
-        }
-        return view;
-    }
-
-    private Spinner spinnerRow(String title, String[] items, int selection,
-                               AdapterView.OnItemSelectedListener listener) {
-        return spinnerRow(title, null, items, selection, listener);
-    }
-
-    private Spinner spinnerRow(String title, String hint, String[] items, int selection,
-                               final AdapterView.OnItemSelectedListener listener) {
-        rowGap();
-        TextView titleView = new TextView(this);
-        titleView.setText(title);
-        titleView.setTextColor(COLOR_TEXT);
-        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        titleView.setPadding(0, dp(10), 0, 0);
-        current.addView(titleView, matchWrap());
-        if (hint != null) {
-            TextView hintView = new TextView(this);
-            hintView.setText(hint);
-            hintView.setTextColor(COLOR_MUTED);
-            hintView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-            current.addView(hintView, matchWrap());
-        }
-        final Spinner spinner = new Spinner(this);
-        spinner.setAdapter(styledAdapter(items));
-        spinner.setSelection(selection);
-        spinner.setBackground(rounded(COLOR_FIELD, 0x33FFFFFF, 10));
-        spinner.setPopupBackgroundDrawable(new ColorDrawable(COLOR_FIELD));
-        // Attach after the first layout: Spinner emits an initial onItemSelected
-        // for the programmatic selection, which must not be treated as a user
-        // change (it would silently overwrite persisted settings).
-        spinner.post(new Runnable() {
-            @Override
-            public void run() {
-                spinner.setOnItemSelectedListener(listener);
-            }
-        });
-        LinearLayout.LayoutParams params = matchWrap();
-        params.topMargin = dp(6);
-        params.bottomMargin = dp(8);
-        current.addView(spinner, params);
-        return spinner;
-    }
-
-    private Spinner intSpinner(String title, String hint, String[] labels, final int[] values,
-                               final String key, int defaultValue) {
-        int stored = prefs.getInt(key, defaultValue);
-        int selection = 0;
-        for (int i = 0; i < values.length; i++) {
-            if (values[i] == defaultValue) {
-                selection = i;
-            }
-        }
-        for (int i = 0; i < values.length; i++) {
-            if (values[i] == stored) {
-                selection = i;
-            }
-        }
-        return intSpinnerAt(title, hint, labels, values, key, selection);
-    }
-
-    private Spinner intSpinnerAt(String title, String hint, String[] labels, final int[] values,
-                                 final String key, int selection) {
-        return spinnerRow(title, hint, labels, selection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putInt(key, values[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-    }
-
-    private Spinner stringSpinner(String title, String hint, String[] labels,
-                                  final String[] values, final String key,
-                                  String defaultValue) {
-        String stored = prefs.getString(key, defaultValue);
-        int selection = 0;
-        for (int i = 0; i < values.length; i++) {
-            if (values[i].equals(stored)) {
-                selection = i;
-            }
-        }
-        return spinnerRow(title, hint, labels, selection,
-                new AdapterView.OnItemSelectedListener() {
-                    @Override
-                    public void onItemSelected(AdapterView<?> parent, View view, int position,
-                                               long id) {
-                        prefs.edit().putString(key, values[position]).apply();
-                    }
-
-                    @Override
-                    public void onNothingSelected(AdapterView<?> parent) {
-                    }
-                });
-    }
-
-    private SeekBar seekRow(String title, float min, float max, float value,
-                            final ValueListener listener) {
-        rowGap();
-        final TextView valueLabel = new TextView(this);
-        valueLabel.setTextColor(COLOR_TEXT);
-        valueLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        valueLabel.setPadding(0, dp(10), 0, 0);
-        current.addView(valueLabel, matchWrap());
-        final SeekBar bar = new SeekBar(this);
-        bar.setMax(1000);
-        bar.setProgressTintList(ColorStateList.valueOf(COLOR_ACCENT));
-        bar.setThumbTintList(ColorStateList.valueOf(COLOR_ACCENT));
-        final float range = max - min;
-        bar.setProgress(Math.round((value - min) / range * 1000f));
-        final String titleText = title;
-        valueLabel.setText(titleText + ": " + String.format(Locale.US, "%.2f", value));
-        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                float shown = min + range * progress / 1000f;
-                valueLabel.setText(titleText + ": " + String.format(Locale.US, "%.2f", shown));
-                if (fromUser) {
-                    listener.onValue(shown);
-                }
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar seekBar) {
-            }
-
-            @Override
-            public void onStopTrackingTouch(SeekBar seekBar) {
-            }
-        });
-        LinearLayout.LayoutParams params = matchWrap();
-        params.bottomMargin = dp(6);
-        current.addView(bar, params);
-        return bar;
-    }
-
-    private EditText createEditText(String hint, String value) {
-        EditText edit = new EditText(this);
-        edit.setHint(hint);
-        edit.setText(value);
-        edit.setTextColor(COLOR_TEXT);
-        edit.setHintTextColor(COLOR_MUTED);
-        edit.setBackground(rounded(COLOR_FIELD, 0x33FFFFFF, 10));
-        edit.setPadding(dp(12), dp(12), dp(12), dp(12));
-        edit.setInputType(InputType.TYPE_CLASS_NUMBER);
-        return edit;
-    }
-
-    private void addField(EditText field) {
-        LinearLayout.LayoutParams params = matchWrap();
-        params.bottomMargin = dp(8);
-        current.addView(field, params);
-    }
-
-    private Button button(String text, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
-        button.setTextColor(Color.WHITE);
-        button.setBackgroundResource(R.drawable.bg_button_secondary);
-        button.setOnClickListener(listener);
-        LinearLayout.LayoutParams params = matchWrap();
-        params.topMargin = dp(8);
-        current.addView(button, params);
-        return button;
-    }
-
-    private Button primaryButton(String text, View.OnClickListener listener) {
-        Button button = button(text, listener);
-        button.setBackgroundResource(R.drawable.bg_play);
-        button.setTypeface(null, Typeface.BOLD);
-        return button;
-    }
-
-    private LinearLayout.LayoutParams matchWrap() {
-        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-    }
-
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+    private int dp(float value) {
+        return Ui.dp(this, value);
     }
 
     private int parseInt(String text, int fallback, int min, int max) {
@@ -1446,10 +1169,8 @@ public class SettingsActivity extends Activity {
         }
         Uri uri = data.getData();
         if (requestCode == StorageUtil.REQUEST_PICK_ISO) {
-            pendingIsoUri = uri;
             confirmIsoCopy(uri);
         } else if (requestCode == StorageUtil.REQUEST_PICK_DRIVER) {
-            pendingDriverUri = uri;
             importDriver(uri);
         }
     }
@@ -1473,13 +1194,9 @@ public class SettingsActivity extends Activity {
                                         driver.loader.getAbsolutePath())
                                 .putString(GameConfig.KEY_DRIVER_LABEL, driver.label)
                                 .apply();
-                        rebuildUi();
-                        if (driver.isFullLoader) {
-                            toast("Imported " + driver.label);
-                        } else {
-                            toast("Imported " + driver.label + " (Adreno driver, used on "
-                                    + "next game start)");
-                        }
+                        rebuild();
+                        toast(driver.isFullLoader ? "Imported " + driver.label
+                                : "Imported " + driver.label + " (used on the next game start)");
                     }
                 });
             }

@@ -1,5 +1,121 @@
 # Changelog
 
+## 0.3.12 (2026-10-08): new launcher, settings and controls editor
+
+- Launcher: large PLAY button that becomes SET UP (opening Game data) when no
+  game data is found; status tiles for game data, renderer, GPU driver,
+  performance and controls, each opening its settings page; quick settings for
+  the performance preset, frame rate cap, touch controls and the fps counter.
+  Landscape shows everything side by side; portrait stacks it.
+- Settings: navigation rail in landscape (tabs in portrait) with Performance,
+  Display, Controls, GPU driver, Game data, Advanced and About pages. Options
+  are segmented choices instead of drop-down lists, and preset tiles show which
+  preset is active. Xenos-only options are greyed out unless that renderer is
+  selected. New Advanced switches: precise GPU barriers, clear with load
+  operations, skip redundant resolves and detailed profiling, plus a reset to
+  default settings that keeps game data, driver and touch layouts.
+- Controls editor: full screen, with the canvas at the phone's own aspect ratio
+  below a toolbar strip (no control is ever hidden under the toolbar), drawn with
+  the overlay's real size and opacity. Drag to move, pinch to resize, snap to grid
+  with centre guides, undo, and per-layout reset. The inspector beside the
+  selected control has size steps and a button grid for remapping (driving
+  labels such as NOS and E-BRAKE follow the mapping). Overlay size, opacity and
+  stick deadzone can be adjusted from the editor toolbar. The Controls page
+  shows a live preview of the starting layout.
+- Screenshots: `docs/screenshots/`.
+
+## 0.3.12 (2026-10-08): renderer bookkeeping, clears and barriers
+
+First batch of `docs/further-optimization-plan.md`. Not yet measured against
+0.3.11 in a controlled scene; the 5 s stats lines report the new counters.
+
+- Detailed profiling is behind `carbon_gpu_profile` (default off, read at
+  startup): CPU draw/resolve timers, GPU timestamp queries, per-pass and
+  per-resolve-destination breakdowns and slow-frame reports. The per-draw
+  timers are one measurement instead of two. The FPS overlay, the 5 s fps /
+  pacing / frame-time percentile lines and the watchdog are unchanged. Watchdog
+  packet and draw counters use single-writer stores instead of atomic adds.
+- Resolve clears use `LOAD_OP_CLEAR` with the render area set to the cleared
+  rectangle, instead of a pass that loads and stores the whole target and then
+  clears the rectangle. Most clears are small rectangles at the top of large
+  targets (256x256 of 280x2080, 640x360 of 640x3728). Pixels outside the
+  rectangle are not loaded or stored. Clears with an empty rectangle no longer
+  start a pass. `carbon_gpu_clear_load_op = false` restores the old path.
+- Image barriers wait only for the stages and accesses of the old layout
+  (attachment output, depth tests, transfer, vertex/fragment shader reads)
+  instead of `ALL_COMMANDS`. A render target written by one rendering pass and
+  attached again in the same layout now gets an attachment dependency, where
+  the old code issued no barrier at all. The presenter's output image keeps the
+  conservative barrier. `carbon_gpu_precise_barriers = false` restores the old
+  barriers.
+
+## 0.3.11 (2026-10-08): phone minimap position
+
+- Move the Android minimap to the upper left, below the layout/reset toolbar
+  and above the steering controls. Map, border, mask, player markers, route and
+  heat meter share the new position. Existing touch layouts are preserved.
+- Apply the layout when the game creates its minimap, including recreation
+  after menus. No additional rendering passes or per-frame layout work.
+- Set `carbon_phone_minimap_top = false` in the Android TOML to use retail placement.
+
+## 0.3.10 (2026-10-08): texture decode and frame pacing hitches
+
+- Copy unconverted texture rows and contiguous 2D microtile runs directly,
+  using NEON byte-order conversion on ARM64. Native BC blocks avoid per-byte
+  scratch copies. Packed mips, 3D/cube layouts and format conversions retain
+  their existing addressing and pixel values.
+- When guest vsync already paces the game at or below the selected FPS cap,
+  omit the additional host-cap sleep that can delay command processing past
+  the next vblank. Lower caps and vsync-disabled runs retain host limiting.
+- Android auto affinity now lets Carbon's actual `MainThread` use all cores,
+  including the prime cores, instead of restricting it to the remaining cores.
+  Explicit user affinity rules retain their existing behavior.
+- Slow-frame diagnostics separate texture decoding from staging allocation.
+  See `docs/hitch-reduction.md` for tests, measurements and remaining limits.
+
+## 0.3.9 (2026-10-08): reduce constant processing and resolve loads
+
+- Process contiguous float-constant writes in stage-sized batches, using NEON
+  endian conversion and bit comparisons on ARM64. Unchanged writes retain the
+  current uniform block; special register side effects and ring wraps keep their
+  existing handling. VS and PS are dirtied independently when values change.
+- Full-destination shader resolves discard old attachment contents instead of
+  loading pixels they overwrite. Partial and atlas resolves preserve other pixels.
+- Renderer diagnostics report unchanged constant words, uploaded/reused stage
+  blocks and full-overwrite resolves once per reporting window.
+
+## 0.3.8 (2026-10-08): stop Android event-loop CPU spinning
+
+- Fix SDL's Android blocking event wait: stop inserting poll sentinels inside
+  the wait loop, where they generate lifecycle wakeups and keep the thread
+  running even with no input. Nonblocking event polling keeps its sentinel.
+  SDK change is recorded in `patches/rexglue-sdl-android-wait.patch`.
+- Audio callbacks count underruns and missing frames without formatting or
+  writing logs. The producer reports those counters at most once every five
+  seconds, making short audio starvation visible without logging on playback.
+
+## 0.3.7 (2026-10-08): prevent stretched fallback presentation
+
+- Aspect-ratio protection is automatic in both display modes. Widescreen off
+  now presents the original 16:9 view with bars, even when an older install
+  saved `present_letterbox = false`. The separate Letterbox switch is removed.
+- The launcher writes `present_letterbox = true`, and the native startup path
+  enforces it for direct game launches too. A one-time HUD diagnostic confirms
+  when its projection correction is reached.
+
+## 0.3.6 (2026-10-08): phone widescreen
+
+- Settings > Graphics > Widescreen (default on) uses the game's drawable aspect
+  ratio, widens full-screen perspective cameras while preserving vertical FOV,
+  and corrects the HUD's horizontal scale. Render targets retain their retail
+  sizes. Updated view-projection matrices and culling planes cover the wider view.
+- Turning Widescreen off restores 16:9 presentation. Keep Letterbox presentation
+  on to preserve proportions. Restart the game after changing the setting.
+- Both renderer paths use the Xbox video mode's corrected display aspect; the
+  movie player's pixel aspect is corrected separately. Hooks check the retail instruction bytes
+  before enabling the camera correction. Device visual validation is pending.
+
+
 ## 0.3.5 (2026-10-07): threaded command processing
 
 - **Command fetch thread** (`carbon_gpu_threaded_cp`, Settings > Graphics > Threaded command processing,

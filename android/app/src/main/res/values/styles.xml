@@ -4,4 +4,20 @@
     <style name="AppTheme" parent="android:Theme.NoTitleBar.Fullscreen">
         <!-- Customize your theme here. -->
     </style>
+
+    <!-- Launcher, settings and controls editor: dark Material widgets and dialogs. -->
+    <style name="LauncherTheme" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/launcher_background</item>
+        <item name="android:colorAccent">#19C6E6</item>
+        <item name="android:colorPrimary">#101826</item>
+        <item name="android:colorPrimaryDark">#06090F</item>
+        <item name="android:colorControlActivated">#19C6E6</item>
+        <item name="android:textColorPrimary">#EAF0F8</item>
+        <item name="android:alertDialogTheme">@style/LauncherDialog</item>
+    </style>
+
+    <style name="LauncherDialog" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#19C6E6</item>
+        <item name="android:windowBackground">@drawable/bg_dialog</item>
+    </style>
 </resources>
